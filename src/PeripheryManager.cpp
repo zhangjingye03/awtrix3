@@ -3,8 +3,11 @@
 #include "Adafruit_BME280.h"
 #include "Adafruit_BMP280.h"
 #include "Adafruit_HTU21DF.h"
+#include "Adafruit_AHTX0.h"
+#ifndef ESP32_C3
 #include "SoftwareSerial.h"
 #include <DFMiniMp3.h>
+#endif
 #include <MelodyPlayer/melody_player.h>
 #include <MelodyPlayer/melody_factory.h>
 #include "Globals.h"
@@ -28,10 +31,12 @@ const char *message = "HELLO"; // Die Nachricht, die gesendet werden soll
 #define MEDIAN_WND 7 // A median filter window size of seven should be enough to filter out most spikes
 #define MEAN_WND 7   // After filtering the spikes we don't need many samples anymore for the average
 
+#ifndef ESP32_C3
 #define DFPLAYER_RX 23
 #define DFPLAYER_TX 18
 #define BUZZER_PIN 15
 #define RESET_PIN 13
+#endif
 
 #ifdef awtrix2_upgrade
 // Pinouts für das WEMOS_D1_MINI32-Environment
@@ -42,6 +47,17 @@ const char *message = "HELLO"; // Die Nachricht, die gesendet werden soll
 
 #define I2C_SCL_PIN D1
 #define I2C_SDA_PIN D3
+
+#elif ESP32_C3
+
+#define LDR_PIN 0
+#define BUTTON_UP_PIN 5
+#define BUTTON_DOWN_PIN 7
+#define BUTTON_SELECT_PIN 6
+#define I2C_SCL_PIN 9
+#define I2C_SDA_PIN 8
+#define BUZZER_PIN 2
+#define RESET_PIN 3
 #elif ESP32_S3
 #define BATTERY_PIN 4
 #define BUZZER_PIN 5
@@ -67,6 +83,8 @@ Adafruit_BME280 bme280;
 Adafruit_BMP280 bmp280;
 Adafruit_HTU21DF htu21df;
 Adafruit_SHT31 sht31;
+Adafruit_AHTX0 ahtx0;
+Adafruit_Sensor *ahtx0_humidity, *ahtx0_temp;
 
 #ifdef awtrix2_upgrade
 #define USED_PHOTOCELL LightDependentResistor::GL5528
@@ -76,18 +94,27 @@ Adafruit_SHT31 sht31;
 #define PHOTOCELL_SERIES_RESISTOR 10000
 #endif
 
+#ifndef ESP32_C3
 class Mp3Notify
 {
 };
 SoftwareSerial mySoftwareSerial(DFPLAYER_RX, DFPLAYER_TX); // RX, TX
 DFMiniMp3<SoftwareSerial, Mp3Notify> dfmp3(mySoftwareSerial);
+#endif
 
 MelodyPlayer player(BUZZER_PIN, 1, LOW);
 
+#ifdef BUTTON_ACTIVE_HIGH
+EasyButton button_left(BUTTON_UP_PIN, 35, true, false);
+EasyButton button_right(BUTTON_DOWN_PIN, 35, true, false);
+EasyButton button_select(BUTTON_SELECT_PIN, 35, true, false);
+EasyButton button_reset(RESET_PIN);
+#else
 EasyButton button_left(BUTTON_UP_PIN);
 EasyButton button_right(BUTTON_DOWN_PIN);
 EasyButton button_select(BUTTON_SELECT_PIN);
 EasyButton button_reset(RESET_PIN);
+#endif
 
 LightDependentResistor photocell(LDR_PIN,
                                  PHOTOCELL_SERIES_RESISTOR,
@@ -269,9 +296,13 @@ void PeripheryManager_::stopSound()
 {
     if (DFPLAYER_ACTIVE)
     {
+#ifndef ESP32_C3
         dfmp3.stopAdvertisement();
         delay(50);
         dfmp3.stop();
+#else
+        // DFPlayer not supported on ESP32-C3.
+#endif
     }
     else
     {
@@ -283,9 +314,13 @@ void PeripheryManager_::setVolume(uint8_t vol)
 {
     if (DFPLAYER_ACTIVE)
     {
+#ifndef ESP32_C3
         uint8_t curVolume = dfmp3.getVolume(); // need to read volume in order to work. Donno why! :(
         dfmp3.setVolume(vol);
         delay(50);
+#else
+        // DFPlayer not supported on ESP32-C3.
+#endif
     }
     else
     {
@@ -330,6 +365,7 @@ const char *PeripheryManager_::playFromFile(String file)
 
     if (DFPLAYER_ACTIVE)
     {
+#ifndef ESP32_C3
         if (DEBUG_MODE)
             DEBUG_PRINTLN(F("Playing MP3 file"));
         if (!DFPLAYER_ACTIVE)
@@ -339,6 +375,9 @@ const char *PeripheryManager_::playFromFile(String file)
         dfmp3.playMp3FolderTrack(file.toInt());
 
         return file.c_str();
+#else
+        return NULL; // DFPlayer not supported on ESP32-C3.
+#endif
     }
     else
     {
@@ -364,10 +403,14 @@ bool PeripheryManager_::isPlaying()
 {
     if (DFPLAYER_ACTIVE)
     {
+#ifndef ESP32_C3
         if ((dfmp3.getStatus() & 0xff) == 0x01) // 0x01 = DfMp3_StatusState_Playing
             return true;
         else
             return false;
+#else
+        return false; // DFPlayer not supported on ESP32-C3.
+#endif
     }
     else
     {
@@ -384,9 +427,11 @@ void PeripheryManager_::setup()
     pinMode(RESET_PIN, INPUT);
     if (DFPLAYER_ACTIVE)
     {
+#ifndef ESP32_C3
         dfmp3.begin();
         delay(100);
         setVolume(SOUND_VOLUME);
+#endif
     }
     button_left.begin();
     button_right.begin();
@@ -439,9 +484,17 @@ void PeripheryManager_::setup()
             DEBUG_PRINTLN(F("SHT31 sensor detected"));
         TEMP_SENSOR_TYPE = TEMP_SENSOR_TYPE_SHT31;
     }
+    else if (ahtx0.begin())
+    {
+        if (DEBUG_MODE)
+            DEBUG_PRINTLN(F("AHTX0 sensor detected"));
+        TEMP_SENSOR_TYPE = TEMP_SENSOR_TYPE_AHTX0;
+    }
 
 #ifdef awtrix2_upgrade
+#ifndef ESP32_C3
     dfmp3.begin();
+#endif
 #else
 
 #endif
@@ -484,7 +537,7 @@ void PeripheryManager_::tick()
     if (currentMillis_BatTempHum - previousMillis_BatTempHum >= interval_BatTempHum)
     {
         previousMillis_BatTempHum = currentMillis_BatTempHum;
-#ifndef awtrix2_upgrade
+#ifdef ULANZI
         uint16_t ADCVALUE = analogRead(BATTERY_PIN);
         // Discard values that are totally out of range, especially the first value read after a reboot.
         // Meaningful values for an Ulanzi clock are in the range 400..700
@@ -516,6 +569,15 @@ void PeripheryManager_::tick()
                 break;
             case TEMP_SENSOR_TYPE_SHT31:
                 sht31.readBoth(&CURRENT_TEMP, &CURRENT_HUM);
+                break;
+            case TEMP_SENSOR_TYPE_AHTX0:
+                ahtx0_humidity = ahtx0.getHumiditySensor();
+                ahtx0_temp = ahtx0.getTemperatureSensor();
+                sensors_event_t tempEvent, humEvent;
+                ahtx0_temp->getEvent(&tempEvent);
+                ahtx0_humidity->getEvent(&humEvent);
+                CURRENT_TEMP = tempEvent.temperature;
+                CURRENT_HUM = humEvent.relative_humidity;
                 break;
             default:
                 CURRENT_TEMP = 0;

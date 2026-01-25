@@ -39,7 +39,9 @@ void PowerManager_::sleepParser(const char *json)
 
 void PowerManager_::sleep(uint64_t seconds)
 {
+#ifndef ESP32_C3
   esp_sleep_enable_ext0_wakeup(WAKEUP_PIN, 0);
+#endif
   esp_sleep_enable_timer_wakeup(seconds * uS_TO_S_FACTOR);
   Serial.print("Going to sleep...\n");
   esp_deep_sleep_start();

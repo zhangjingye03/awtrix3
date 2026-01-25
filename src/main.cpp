@@ -61,8 +61,10 @@ void BootAnimation(void *parameter)
 
 void setup()
 {
+#ifndef ESP32_C3
   pinMode(15, OUTPUT);
   digitalWrite(15, LOW);
+#endif
   delay(2000);
   Serial.begin(115200);
   loadSettings();

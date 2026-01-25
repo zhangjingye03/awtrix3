@@ -36,6 +36,8 @@ bool sendFrame = 1;
 int previousDataLength = 0;
 #ifdef awtrix2_upgrade
 #define MATRIX_PIN D2
+#elif defined(ESP32_C3)
+#define MATRIX_PIN 1
 #else
 #define MATRIX_PIN 32
 #endif
@@ -1638,7 +1640,7 @@ String DisplayManager_::getStats()
   StaticJsonDocument<1024> doc;
   char buffer[20];
 
-#ifdef awtrix2_upgrade
+#if defined(awtrix2_upgrade) || defined(ESP32_C3)
   doc[F("type")] = 1;
 #else
   doc[BatKey] = BATTERY_PERCENT;
@@ -1686,6 +1688,12 @@ void DisplayManager_::setMatrixLayout(int layout)
     break;
   case 2:
     matrix = new FastLED_NeoMatrix(leds, 32, 8, NEO_MATRIX_TOP + NEO_MATRIX_LEFT + NEO_MATRIX_COLUMNS + NEO_MATRIX_ZIGZAG);
+    break; 
+  case 3:
+    matrix = new FastLED_NeoMatrix(leds, 32, 8, NEO_MATRIX_TOP + NEO_MATRIX_LEFT + NEO_MATRIX_ROWS + NEO_MATRIX_PROGRESSIVE);
+    break;
+  case 4:
+    matrix = new FastLED_NeoMatrix(leds, 32, 8, NEO_MATRIX_TOP + NEO_MATRIX_LEFT + NEO_MATRIX_COLUMNS + NEO_MATRIX_PROGRESSIVE);
     break;
   default:
     break;
