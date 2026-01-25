@@ -143,7 +143,7 @@ const char HAipAddrIcon[] PROGMEM = {"mdi:wifi"};
 
 
 
-#ifndef awtrix2_upgrade
+#ifdef ULANZI
 const char BatKey[] PROGMEM = {"bat"};
 const char BatRawKey[] PROGMEM = {"bat_raw"};
 #endif

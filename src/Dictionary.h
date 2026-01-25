@@ -138,7 +138,7 @@ extern const char HAipAddrRID[];
 extern const char HAipAddrName[];
 extern const char HAipAddrIcon[];
 
-#ifndef awtrix2_upgrade
+#ifdef ULANZI
 extern const char BatKey[];
 extern const char BatRawKey[];
 #endif
