@@ -19,6 +19,31 @@
  ***************************************************************************/
 #include "melody_player.h"
 #include "../Globals.h"
+#ifdef ESP32
+#include <esp_arduino_version.h>
+
+static inline void melodyLedcWriteTone(uint8_t pin, uint8_t channel, uint32_t freq)
+{
+#if ESP_ARDUINO_VERSION >= ESP_ARDUINO_VERSION_VAL(3, 0, 0)
+  (void)channel;
+  ledcWriteTone(pin, freq);
+#else
+  (void)pin;
+  ledcWriteTone(channel, freq);
+#endif
+}
+
+static inline void melodyLedcWrite(uint8_t pin, uint8_t channel, uint32_t duty)
+{
+#if ESP_ARDUINO_VERSION >= ESP_ARDUINO_VERSION_VAL(3, 0, 0)
+  (void)channel;
+  ledcWrite(pin, duty);
+#else
+  (void)pin;
+  ledcWrite(channel, duty);
+#endif
+}
+#endif
 /**
  * https://stackoverflow.com/questions/24609271/errormake-unique-is-not-a-member-of-std
  */
@@ -47,7 +72,7 @@ void MelodyPlayer::play()
     if (melodyState->isSilence())
     {
 #ifdef ESP32
-      ledcWriteTone(pwmChannel, 0);
+      melodyLedcWriteTone(pin, pwmChannel, 0);
 #else
       noTone(pin);
 #endif
@@ -56,7 +81,7 @@ void MelodyPlayer::play()
     else
     {
 #ifdef ESP32
-      ledcWriteTone(pwmChannel, computedNote.frequency);
+      melodyLedcWriteTone(pin, pwmChannel, computedNote.frequency);
 #else
       tone(pin, computedNote.frequency);
 #endif
@@ -109,7 +134,7 @@ void changeTone(MelodyPlayer *player)
       if (!player->muted)
       {
 #ifdef ESP32
-        ledcWriteTone(player->pwmChannel, 0);
+        melodyLedcWriteTone(player->pin, player->pwmChannel, 0);
 #else
         tone(player->pin, 0);
 #endif
@@ -126,9 +151,9 @@ void changeTone(MelodyPlayer *player)
       if (!player->muted)
       {
 #ifdef ESP32
-        ledcWriteTone(player->pwmChannel, computedNote.frequency);
+        melodyLedcWriteTone(player->pin, player->pwmChannel, computedNote.frequency);
         if (BUZ_VOL)
-          ledcWrite(player->pwmChannel, player->volume);
+          melodyLedcWrite(player->pin, player->pwmChannel, player->volume);
 #else
         tone(player->pin, computedNote.frequency);
 #endif
@@ -286,9 +311,13 @@ void MelodyPlayer::turnOn()
 #ifdef ESP32
   const int resolution = 8;
   // 2000 is a frequency, it will be changed at the first play
+#if ESP_ARDUINO_VERSION >= ESP_ARDUINO_VERSION_VAL(3, 0, 0)
+  ledcAttachChannel(pin, 2000, resolution, pwmChannel);
+#else
   ledcSetup(pwmChannel, 2000, resolution);
   ledcAttachPin(pin, pwmChannel);
-  ledcWrite(pwmChannel, volume);
+#endif
+  melodyLedcWrite(pin, pwmChannel, volume);
 #endif
 }
 
@@ -298,7 +327,7 @@ void MelodyPlayer::setVolume(byte newVolume)
 #ifdef ESP32
   if (state == State::PLAY)
   {
-    ledcWrite(pwmChannel, volume);
+    melodyLedcWrite(pin, pwmChannel, volume);
   }
 #endif
 }
@@ -306,8 +335,13 @@ void MelodyPlayer::setVolume(byte newVolume)
 void MelodyPlayer::turnOff()
 {
 #ifdef ESP32
-  ledcWrite(pwmChannel, 0);
+#if ESP_ARDUINO_VERSION >= ESP_ARDUINO_VERSION_VAL(3, 0, 0)
+  melodyLedcWrite(pin, pwmChannel, 0);
+  ledcDetach(pin);
+#else
+  melodyLedcWrite(pin, pwmChannel, 0);
   ledcDetachPin(pin);
+#endif
 #else
   // Remember that this will set LOW output, it doesn't mean that buzzer is off (look at offLevel
   // for more info).
@@ -326,7 +360,11 @@ void MelodyPlayer::mute()
 void MelodyPlayer::unmute()
 {
 #ifdef ESP32
+#if ESP_ARDUINO_VERSION >= ESP_ARDUINO_VERSION_VAL(3, 0, 0)
+  ledcAttachChannel(pin, 2000, 8, pwmChannel);
+#else
   ledcAttachPin(pin, pwmChannel);
+#endif
 #endif
   muted = false;
 }
