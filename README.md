@@ -87,6 +87,12 @@ https://flows.blueforcer.de/
 - No cloud 
 - No telemetry
 
+# Hardware Notes
+- ESP32-C3 builds are supported via the `esp32-c3` PlatformIO environment and the custom board definition.
+- ESP32-C3 pin mapping is defined for buttons, I2C, and buzzer; DFPlayer MP3 modules are not supported on ESP32-C3.
+- AHTX0 temperature/humidity sensors are auto-detected.
+- Battery telemetry and related apps are only enabled on Ulanzi hardware.
+
 # Getting Started
 Starting is easy as 1-2-3
 [with the documentation](https://blueforcer.github.io/awtrix3/)
