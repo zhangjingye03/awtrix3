@@ -102,7 +102,11 @@ SoftwareSerial mySoftwareSerial(DFPLAYER_RX, DFPLAYER_TX); // RX, TX
 DFMiniMp3<SoftwareSerial, Mp3Notify> dfmp3(mySoftwareSerial);
 #endif
 
+#ifdef BUZZER_ACTIVE_LOW
+MelodyPlayer player(BUZZER_PIN, 1, HIGH);
+#else
 MelodyPlayer player(BUZZER_PIN, 1, LOW);
+#endif
 
 #ifdef BUTTON_ACTIVE_HIGH
 EasyButton button_left(BUTTON_UP_PIN, 35, true, false);
