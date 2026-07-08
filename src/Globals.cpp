@@ -254,6 +254,10 @@ void loadSettings()
     Settings.begin("awtrix", false);
     BRIGHTNESS = Settings.getUInt("BRI", 120);
     AUTO_BRIGHTNESS = Settings.getBool("ABRI", false);
+    if (DEBUG_MODE)
+    {
+        DEBUG_PRINTF("Loaded brightness=%d, auto=%s", BRIGHTNESS, AUTO_BRIGHTNESS ? "true" : "false");
+    }
     UPPERCASE_LETTERS = Settings.getBool("UPPER", true);
     TEXTCOLOR_888 = Settings.getUInt("TCOL", 0xFFFFFF);
     CALENDAR_HEADER_COLOR = Settings.getUInt("CHCOL", 0xFF0000);

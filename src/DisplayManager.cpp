@@ -34,12 +34,14 @@ const int maxUniverses = numberOfChannels / 512 + ((numberOfChannels % 512) ? 1 
 bool universesReceived[maxUniverses];
 bool sendFrame = 1;
 int previousDataLength = 0;
+#ifndef MATRIX_PIN
 #ifdef awtrix2_upgrade
 #define MATRIX_PIN D2
 #elif defined(ESP32_C3)
 #define MATRIX_PIN 1
 #else
 #define MATRIX_PIN 32
+#endif
 #endif
 
 #define MATRIX_WIDTH 32
@@ -50,7 +52,7 @@ GifPlayer gif;
 uint16_t gifX, gifY;
 CRGB leds[MATRIX_WIDTH * MATRIX_HEIGHT];
 CRGB ledsCopy[MATRIX_WIDTH * MATRIX_HEIGHT];
-float actualBri;
+float actualBri = BRIGHTNESS;
 int16_t cursor_x, cursor_y;
 uint32_t textColor;
 
@@ -68,7 +70,7 @@ DisplayManager_ &DisplayManager = DisplayManager.getInstance();
 
 void DisplayManager_::setBrightness(int bri)
 {
-  bool wakeup;
+  bool wakeup = false;
   if (!notifications.empty())
   {
     wakeup = notifications[0].wakeup;
@@ -82,6 +84,11 @@ void DisplayManager_::setBrightness(int bri)
   {
     matrix->setBrightness(bri);
     actualBri = bri;
+  }
+
+  if (DEBUG_MODE)
+  {
+    DEBUG_PRINTF("Brightness set to %d, auto=%s, matrixOff=%s", bri, AUTO_BRIGHTNESS ? "true" : "false", MATRIX_OFF ? "true" : "false");
   }
 }
 
@@ -146,7 +153,7 @@ void DisplayManager_::resetTextColor()
 void DisplayManager_::clearMatrix()
 {
   matrix->clear();
-  matrix->show();
+  show();
 }
 
 bool jpg_output(int16_t x, int16_t y, uint16_t w, uint16_t h, uint16_t *bitmap)
@@ -222,7 +229,7 @@ void DisplayManager_::HSVtext(int16_t x, int16_t y, const char *text, bool clear
   }
   hueOffset++;
   if (clear)
-    matrix->show();
+    show();
 }
 
 uint32_t interpolateColor(uint32_t color1, uint32_t color2, float t)
@@ -281,7 +288,7 @@ void DisplayManager_::GradientText(int16_t x, int16_t y, const char *text, int c
   }
 
   if (clear)
-    matrix->show();
+    show();
 }
 
 void pushCustomApp(String name, int position)
@@ -1220,7 +1227,7 @@ void DisplayManager_::tick()
   if (GAME_ACTIVE)
   {
     GameManager.tick();
-    matrix->show();
+    show();
     memcpy(ledsCopy, leds, sizeof(leds));
   }
   else if (AP_MODE)
@@ -1300,7 +1307,7 @@ void onDmxFrame(uint16_t universe, uint16_t length, uint8_t sequence, uint8_t *d
   if (universe == 10)
   {
     matrix->setBrightness(data[0]);
-    matrix->show();
+    DisplayManager.show();
   }
 
   // Store which universe has got in
@@ -1328,7 +1335,7 @@ void onDmxFrame(uint16_t universe, uint16_t length, uint8_t sequence, uint8_t *d
 
   if (sendFrame)
   {
-    matrix->show();
+    DisplayManager.show();
     // Reset universeReceived to 0
     memset(universesReceived, 0, maxUniverses);
   }
@@ -2508,7 +2515,7 @@ bool DisplayManager_::moodlight(const char *json)
 
   MOODLIGHT_MODE = true;
   doc.clear();
-  matrix->show();
+  show();
   return true;
 }
 

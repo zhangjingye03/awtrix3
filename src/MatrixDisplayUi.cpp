@@ -250,7 +250,7 @@ void MatrixDisplayUi::tick()
     EffectOverlay(matrix, 0, 0, GLOBAL_OVERLAY);
   }
   DisplayManager.gammaCorrection();
-  this->matrix->show();
+  DisplayManager.show();
 }
 
 void MatrixDisplayUi::drawIndicators()
