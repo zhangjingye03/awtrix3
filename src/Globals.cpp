@@ -404,6 +404,8 @@ uint16_t BATTERY_RAW = 0;
 #endif
 float HUM_OFFSET;
 uint16_t LDR_RAW;
+bool LD2402_PRESENCE = false;
+uint16_t LD2402_DISTANCE_CM = 0;
 String TIME_FORMAT = "%H:%M:%S";
 String DATE_FORMAT = "%d.%m.%y";
 int BACKGROUND_EFFECT = -1;

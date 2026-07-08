@@ -1658,6 +1658,8 @@ String DisplayManager_::getStats()
 #endif
   doc[LuxKey] = static_cast<int>(CURRENT_LUX);
   doc[LDRRawKey] = LDR_RAW;
+  doc[F("ld2402_presence")] = LD2402_PRESENCE;
+  doc[F("ld2402_distance")] = LD2402_DISTANCE_CM;
   doc[RamKey] = ESP.getFreeHeap() + ESP.getFreePsram();
   doc[BrightnessKey] = BRIGHTNESS;
   if (SENSOR_READING)

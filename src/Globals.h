@@ -70,6 +70,8 @@ extern float CURRENT_TEMP;
 extern float CURRENT_HUM;
 extern float CURRENT_LUX;
 extern uint16_t LDR_RAW;
+extern bool LD2402_PRESENCE;
+extern uint16_t LD2402_DISTANCE_CM;
 extern String CURRENT_APP;
 extern int BACKGROUND_EFFECT;
 extern uint8_t BATTERY_PERCENT;

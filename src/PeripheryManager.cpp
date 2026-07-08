@@ -4,6 +4,7 @@
 #include "Adafruit_BMP280.h"
 #include "Adafruit_HTU21DF.h"
 #include "Adafruit_AHTX0.h"
+#include <BH1750.h>
 #ifndef ESP32_C3
 #include "SoftwareSerial.h"
 #include <DFMiniMp3.h>
@@ -58,6 +59,13 @@ const char *message = "HELLO"; // Die Nachricht, die gesendet werden soll
 #define I2C_SDA_PIN 8
 #define BUZZER_PIN 2
 #define RESET_PIN 3
+#ifndef LD2402_RX_PIN
+#define LD2402_RX_PIN 4
+#endif
+#ifndef LD2402_TX_PIN
+#define LD2402_TX_PIN 10
+#endif
+#define LD2402_BAUD 115200
 #elif ESP32_S3
 #define BATTERY_PIN 4
 #define BUZZER_PIN 5
@@ -85,6 +93,15 @@ Adafruit_HTU21DF htu21df;
 Adafruit_SHT31 sht31;
 Adafruit_AHTX0 ahtx0;
 Adafruit_Sensor *ahtx0_humidity, *ahtx0_temp;
+BH1750 bh1750;
+bool bh1750Detected = false;
+
+#ifdef ESP32_C3
+HardwareSerial ld2402Serial(1);
+String ld2402Line;
+bool ld2402ReportedOnce = false;
+unsigned long lastLD2402Log = 0;
+#endif
 
 #ifdef awtrix2_upgrade
 #define USED_PHOTOCELL LightDependentResistor::GL5528
@@ -159,6 +176,74 @@ PeripheryManager_ &PeripheryManager_::getInstance()
 
 // Initialize the global shared instance
 PeripheryManager_ &PeripheryManager = PeripheryManager.getInstance();
+
+#ifdef ESP32_C3
+static void setLD2402State(bool presence, uint16_t distanceCm)
+{
+    const bool changed = (LD2402_PRESENCE != presence) || (LD2402_DISTANCE_CM != distanceCm);
+    LD2402_PRESENCE = presence;
+    LD2402_DISTANCE_CM = distanceCm;
+
+    if (DEBUG_MODE && (changed || !ld2402ReportedOnce || millis() - lastLD2402Log >= 5000))
+    {
+        DEBUG_PRINTF("LD2402 presence=%s distance=%u cm", presence ? "true" : "false", distanceCm);
+        ld2402ReportedOnce = true;
+        lastLD2402Log = millis();
+    }
+}
+
+static void parseLD2402Line(String line)
+{
+    line.trim();
+    if (line.length() == 0)
+        return;
+
+    String upperLine = line;
+    upperLine.toUpperCase();
+    if (upperLine.indexOf(F("OFF")) >= 0)
+    {
+        setLD2402State(false, 0);
+        return;
+    }
+
+    int firstDigit = -1;
+    for (int i = 0; i < line.length(); i++)
+    {
+        if (isDigit(line.charAt(i)))
+        {
+            firstDigit = i;
+            break;
+        }
+    }
+
+    if (firstDigit < 0)
+        return;
+
+    uint16_t distanceCm = line.substring(firstDigit).toInt();
+    setLD2402State(distanceCm > 0, distanceCm);
+}
+
+static void pollLD2402()
+{
+    while (ld2402Serial.available() > 0)
+    {
+        const char c = static_cast<char>(ld2402Serial.read());
+        if (c == '\r' || c == '\n')
+        {
+            parseLD2402Line(ld2402Line);
+            ld2402Line = "";
+            continue;
+        }
+
+        if (isPrintable(c))
+        {
+            ld2402Line += c;
+            if (ld2402Line.length() > 80)
+                ld2402Line = "";
+        }
+    }
+}
+#endif
 
 void left_button_pressed()
 {
@@ -495,6 +580,20 @@ void PeripheryManager_::setup()
         TEMP_SENSOR_TYPE = TEMP_SENSOR_TYPE_AHTX0;
     }
 
+    if (bh1750.begin(BH1750::CONTINUOUS_HIGH_RES_MODE, 0x23, &Wire) ||
+        bh1750.begin(BH1750::CONTINUOUS_HIGH_RES_MODE, 0x5C, &Wire))
+    {
+        bh1750Detected = true;
+        if (DEBUG_MODE)
+            DEBUG_PRINTLN(F("BH1750 light sensor detected"));
+    }
+
+#ifdef ESP32_C3
+    ld2402Serial.begin(LD2402_BAUD, SERIAL_8N1, LD2402_RX_PIN, LD2402_TX_PIN);
+    if (DEBUG_MODE)
+        DEBUG_PRINTF("LD2402 UART1 enabled at %u baud, RX GPIO %d, TX GPIO %d", LD2402_BAUD, LD2402_RX_PIN, LD2402_TX_PIN);
+#endif
+
 #ifdef awtrix2_upgrade
 #ifndef ESP32_C3
     dfmp3.begin();
@@ -508,6 +607,10 @@ void PeripheryManager_::setup()
 
 void PeripheryManager_::tick()
 {
+#ifdef ESP32_C3
+    pollLD2402();
+#endif
+
     if (!MenuManager.inMenu)
     {
         if (ROTATE_SCREEN)
@@ -608,7 +711,16 @@ void PeripheryManager_::tick()
             LDRVALUE = 1023.0 - LDRVALUE;
         // Send LDR values through median filter to get rid of the remaining spikes and then calculate the average
         LDR_RAW = meanFilterLDR.AddValue(medianFilterLDR.AddValue(LDRVALUE));
-        CURRENT_LUX = (roundf(photocell.getSmoothedLux() * 1000) / 1000);
+        if (bh1750Detected)
+        {
+            const float lux = bh1750.readLightLevel();
+            if (lux >= 0)
+                CURRENT_LUX = (roundf(lux * 1000) / 1000);
+        }
+        else
+        {
+            CURRENT_LUX = (roundf(photocell.getSmoothedLux() * 1000) / 1000);
+        }
         if (AUTO_BRIGHTNESS && !MATRIX_OFF)
         {
             brightnessPercent = (LDR_RAW * LDR_FACTOR) / 1023.0 * 100.0;
