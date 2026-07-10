@@ -5,6 +5,7 @@
 #include <ArduinoHA.h>
 #include <WiFi.h>
 #include <ArduinoJson.h>
+#include <LittleFS.h>
 #include "Dictionary.h"
 #include "PeripheryManager.h"
 #include "UpdateManager.h"
@@ -18,18 +19,298 @@ HAMqtt mqtt(espClient, device, 26);
 
 HALight *Matrix, *Indikator1, *Indikator2, *Indikator3 = nullptr;
 HASelect *BriMode, *transEffect = nullptr;
-HAButton *dismiss, *nextApp, *prevApp, *doUpdate = nullptr;
+HAButton *dismiss, *nextApp, *prevApp, *doUpdate, *ld2402Calibrate = nullptr;
 HASwitch *transition = nullptr;
 #ifdef ULANZI
 HASensor *battery = nullptr;
 #endif
-HASensor *temperature, *humidity, *illuminance, *uptime, *strength, *version, *ram, *curApp, *myOwnID, *ipAddr = nullptr;
-HABinarySensor *btnleft, *btnmid, *btnright = nullptr;
+HASensor *temperature, *humidity, *illuminance, *uptime, *strength, *version, *ram, *curApp, *myOwnID, *ipAddr, *ld2402Motion, *ld2402Distance = nullptr;
+HABinarySensor *btnleft, *btnmid, *btnright, *ld2402Presence = nullptr;
 bool connected;
-char matID[40], ind1ID[40], ind2ID[40], ind3ID[40], briID[40], btnAID[40], btnBID[40], btnCID[40], appID[40], tempID[40], humID[40], luxID[40], verID[40], ramID[40], upID[40], sigID[40], btnLID[40], btnMID[40], btnRID[40], transID[40], doUpdateID[40], batID[40], myID[40], sSpeed[40], effectID[40], ipAddrID[40];
+char matID[40], ind1ID[40], ind2ID[40], ind3ID[40], briID[40], btnAID[40], btnBID[40], btnCID[40], appID[40], tempID[40], humID[40], luxID[40], verID[40], ramID[40], upID[40], sigID[40], btnLID[40], btnMID[40], btnRID[40], transID[40], doUpdateID[40], batID[40], myID[40], sSpeed[40], effectID[40], ipAddrID[40], ld2402PresenceID[40], ld2402MotionID[40], ld2402DistanceID[40], ld2402CalibrateID[40];
 long previousMillis_Stats;
 std::map<String, String> mqttValues;
 std::vector<String> topicsToSubscribe;
+static char mqttPayloadBuffer[1024];
+
+static const uint32_t MQTT_MIN_FREE_HEAP = 12000;
+static const uint32_t MQTT_MIN_MAX_ALLOC_HEAP = 4096;
+#ifdef ESP32_C3
+static const uint32_t MQTT_C3_CURRENT_APP_MIN_FREE_HEAP = 20000;
+static const uint32_t MQTT_C3_CURRENT_APP_MIN_MAX_ALLOC_HEAP = 6000;
+static const unsigned long MQTT_C3_FULL_STATS_INTERVAL = 30000;
+static unsigned long c3LastFullStatsPublish = 0;
+#endif
+
+#ifdef ESP32_C3
+static bool c3LightHaDiscoveryRequested = false;
+static bool c3LightHaDiscoveryPending = false;
+static uint8_t c3LightHaDiscoveryStep = 0;
+static unsigned long c3LightHaDiscoveryLastPublish = 0;
+#endif
+
+static const char *ld2402MotionText()
+{
+    if (LD2402_MOVING_STATE > 0)
+        return "moving";
+    if (LD2402_MOVING_STATE == 0)
+        return "still";
+    return "unknown";
+}
+
+static bool mqttHasWriteRoom()
+{
+    if (MQTT_HOST == "" || !mqtt.isConnected())
+        return false;
+
+    const uint32_t freeHeap = ESP.getFreeHeap();
+    const uint32_t maxAllocHeap = ESP.getMaxAllocHeap();
+    if (freeHeap >= MQTT_MIN_FREE_HEAP && maxAllocHeap >= MQTT_MIN_MAX_ALLOC_HEAP)
+        return true;
+
+    static unsigned long lastLowHeapLog = 0;
+    if (millis() - lastLowHeapLog > 10000)
+    {
+        lastLowHeapLog = millis();
+        DEBUG_PRINTF("Skip MQTT publish: low heap free=%lu max_alloc=%lu bytes", freeHeap, maxAllocHeap);
+    }
+    return false;
+}
+
+static void stopMqttAfterWriteFailure()
+{
+    connected = false;
+    espClient.stop();
+    if (DEBUG_MODE)
+        DEBUG_PRINTLN(F("MQTT publish failed; closing client socket"));
+}
+
+static bool mqttPublishRetained(const char *topic, const char *payload)
+{
+    if (!mqttHasWriteRoom())
+        return false;
+
+    if (!mqtt.publish(topic, payload, true))
+    {
+        stopMqttAfterWriteFailure();
+        return false;
+    }
+    return true;
+}
+
+#ifdef ESP32_C3
+static int buildHaDeviceJson(char *buffer, size_t length)
+{
+    return snprintf(buffer, length,
+                    "\"device\":{\"identifiers\":[\"%s\"],\"name\":\"%s\",\"manufacturer\":\"%s\",\"model\":\"%s\",\"sw_version\":\"%s\"}",
+                    MQTT_PREFIX.c_str(), HOSTNAME.c_str(), HAmanufacturer, HAmodel, VERSION);
+}
+
+static bool publishC3HaConfig(const char *component, const char *objectId, const char *payload)
+{
+    char topic[160];
+    snprintf(topic, sizeof(topic), "%s/%s/%s_%s/config", HA_PREFIX.c_str(), component, MQTT_PREFIX.c_str(), objectId);
+    return mqttPublishRetained(topic, payload);
+}
+
+static bool clearC3HaConfig(const char *component, const char *objectId)
+{
+    char topic[160];
+    snprintf(topic, sizeof(topic), "%s/%s/%s_%s/config", HA_PREFIX.c_str(), component, MQTT_PREFIX.c_str(), objectId);
+    return mqttPublishRetained(topic, "");
+}
+
+static void persistBrightnessSlope()
+{
+    DynamicJsonDocument doc(512);
+    if (LittleFS.exists("/dev.json"))
+    {
+        File readFile = LittleFS.open("/dev.json", "r");
+        if (readFile)
+        {
+            deserializeJson(doc, readFile);
+            readFile.close();
+        }
+    }
+
+    doc["ldr_factor"] = LDR_FACTOR;
+
+    File writeFile = LittleFS.open("/dev.json", "w");
+    if (writeFile)
+    {
+        serializeJsonPretty(doc, writeFile);
+        writeFile.close();
+    }
+}
+
+static void publishC3HaDiscoveryTick(unsigned long now)
+{
+    if (!c3LightHaDiscoveryPending || !mqtt.isConnected())
+        return;
+
+    if (now - c3LightHaDiscoveryLastPublish < 2500)
+        return;
+
+    char deviceJson[260];
+    buildHaDeviceJson(deviceJson, sizeof(deviceJson));
+
+    char payload[960];
+    bool published = false;
+
+    switch (c3LightHaDiscoveryStep)
+    {
+    case 0:
+        snprintf(payload, sizeof(payload),
+                 "{\"name\":\"BH1750 Illuminance\",\"unique_id\":\"%s_bh1750_lux\",\"state_topic\":\"%s/stats/lux\",\"device_class\":\"illuminance\",\"unit_of_measurement\":\"lx\",\"icon\":\"mdi:sun-wireless\",%s}",
+                 MQTT_PREFIX.c_str(), MQTT_PREFIX.c_str(), deviceJson);
+        published = publishC3HaConfig("sensor", "bh1750_lux", payload);
+        break;
+    case 1:
+        snprintf(payload, sizeof(payload),
+                 "{\"name\":\"LD2402 Presence\",\"unique_id\":\"%s_ld2402_presence\",\"state_topic\":\"%s/ld2402/status\",\"value_template\":\"{{ 'true' if value_json.presence else 'false' }}\",\"payload_on\":\"true\",\"payload_off\":\"false\",\"device_class\":\"occupancy\",%s}",
+                 MQTT_PREFIX.c_str(), MQTT_PREFIX.c_str(), deviceJson);
+        published = publishC3HaConfig("binary_sensor", "ld2402_presence", payload);
+        break;
+    case 2:
+        snprintf(payload, sizeof(payload),
+                 "{\"name\":\"LD2402 Motion\",\"unique_id\":\"%s_ld2402_motion\",\"state_topic\":\"%s/ld2402/status\",\"value_template\":\"{{ value_json.motion }}\",\"icon\":\"mdi:motion-sensor\",%s}",
+                 MQTT_PREFIX.c_str(), MQTT_PREFIX.c_str(), deviceJson);
+        published = publishC3HaConfig("sensor", "ld2402_motion", payload);
+        break;
+    case 3:
+        snprintf(payload, sizeof(payload),
+                 "{\"name\":\"LD2402 Distance\",\"unique_id\":\"%s_ld2402_distance\",\"state_topic\":\"%s/ld2402/status\",\"value_template\":\"{{ value_json.distance }}\",\"unit_of_measurement\":\"cm\",\"icon\":\"mdi:map-marker-distance\",%s}",
+                 MQTT_PREFIX.c_str(), MQTT_PREFIX.c_str(), deviceJson);
+        published = publishC3HaConfig("sensor", "ld2402_distance", payload);
+        break;
+    case 4:
+        snprintf(payload, sizeof(payload),
+                 "{\"name\":\"LD2402 Calibrate\",\"unique_id\":\"%s_ld2402_calibrate\",\"command_topic\":\"%s/ld2402/calibrate\",\"payload_press\":\"1\",\"icon\":\"mdi:tune-variant\",%s}",
+                 MQTT_PREFIX.c_str(), MQTT_PREFIX.c_str(), deviceJson);
+        published = publishC3HaConfig("button", "ld2402_calibrate", payload);
+        break;
+    case 5:
+        snprintf(payload, sizeof(payload),
+                 "{\"name\":\"Temperature\",\"unique_id\":\"%s_temperature\",\"state_topic\":\"%s/stats\",\"value_template\":\"{{ value_json.temp }}\",\"device_class\":\"temperature\",\"unit_of_measurement\":\"C\",\"icon\":\"mdi:thermometer\",%s}",
+                 MQTT_PREFIX.c_str(), MQTT_PREFIX.c_str(), deviceJson);
+        published = publishC3HaConfig("sensor", "temperature", payload);
+        break;
+    case 6:
+        snprintf(payload, sizeof(payload),
+                 "{\"name\":\"Humidity\",\"unique_id\":\"%s_humidity\",\"state_topic\":\"%s/stats\",\"value_template\":\"{{ value_json.hum }}\",\"device_class\":\"humidity\",\"unit_of_measurement\":\"%%\",\"icon\":\"mdi:water-percent\",%s}",
+                 MQTT_PREFIX.c_str(), MQTT_PREFIX.c_str(), deviceJson);
+        published = publishC3HaConfig("sensor", "humidity", payload);
+        break;
+    case 7:
+        snprintf(payload, sizeof(payload),
+                 "{\"name\":\"Current App\",\"unique_id\":\"%s_current_app\",\"state_topic\":\"%s/stats\",\"value_template\":\"{{ value_json.app }}\",\"icon\":\"mdi:apps\",%s}",
+                 MQTT_PREFIX.c_str(), MQTT_PREFIX.c_str(), deviceJson);
+        published = publishC3HaConfig("sensor", "current_app", payload);
+        break;
+    case 8:
+        snprintf(payload, sizeof(payload),
+                 "{\"name\":\"Brightness\",\"unique_id\":\"%s_brightness\",\"state_topic\":\"%s/stats\",\"value_template\":\"{{ value_json.bri }}\",\"unit_of_measurement\":\"%%\",\"icon\":\"mdi:brightness-6\",%s}",
+                 MQTT_PREFIX.c_str(), MQTT_PREFIX.c_str(), deviceJson);
+        published = publishC3HaConfig("sensor", "brightness", payload);
+        break;
+    case 9:
+        snprintf(payload, sizeof(payload),
+                 "{\"name\":\"Free RAM\",\"unique_id\":\"%s_ram\",\"state_topic\":\"%s/stats\",\"value_template\":\"{{ value_json.ram }}\",\"device_class\":\"data_size\",\"unit_of_measurement\":\"B\",\"icon\":\"mdi:memory\",%s}",
+                 MQTT_PREFIX.c_str(), MQTT_PREFIX.c_str(), deviceJson);
+        published = publishC3HaConfig("sensor", "ram", payload);
+        break;
+    case 10:
+        snprintf(payload, sizeof(payload),
+                 "{\"name\":\"Uptime\",\"unique_id\":\"%s_uptime\",\"state_topic\":\"%s/stats\",\"value_template\":\"{{ value_json.uptime }}\",\"device_class\":\"duration\",\"unit_of_measurement\":\"s\",\"icon\":\"mdi:timer-outline\",%s}",
+                 MQTT_PREFIX.c_str(), MQTT_PREFIX.c_str(), deviceJson);
+        published = publishC3HaConfig("sensor", "uptime", payload);
+        break;
+    case 11:
+        snprintf(payload, sizeof(payload),
+                 "{\"name\":\"WiFi Signal\",\"unique_id\":\"%s_wifi_signal\",\"state_topic\":\"%s/stats\",\"value_template\":\"{{ value_json.wifi_signal }}\",\"device_class\":\"signal_strength\",\"unit_of_measurement\":\"dB\",\"icon\":\"mdi:wifi\",%s}",
+                 MQTT_PREFIX.c_str(), MQTT_PREFIX.c_str(), deviceJson);
+        published = publishC3HaConfig("sensor", "wifi_signal", payload);
+        break;
+    case 12:
+        snprintf(payload, sizeof(payload),
+                 "{\"name\":\"IP Address\",\"unique_id\":\"%s_ip_address\",\"state_topic\":\"%s/stats\",\"value_template\":\"{{ value_json.ip_address }}\",\"icon\":\"mdi:ip-network\",%s}",
+                 MQTT_PREFIX.c_str(), MQTT_PREFIX.c_str(), deviceJson);
+        published = publishC3HaConfig("sensor", "ip_address", payload);
+        break;
+    case 13:
+        snprintf(payload, sizeof(payload),
+                 "{\"name\":\"Matrix Power\",\"unique_id\":\"%s_matrix_power\",\"state_topic\":\"%s/stats\",\"value_template\":\"{{ 'true' if value_json.matrix else 'false' }}\",\"payload_on\":\"true\",\"payload_off\":\"false\",\"icon\":\"mdi:clock-digital\",%s}",
+                 MQTT_PREFIX.c_str(), MQTT_PREFIX.c_str(), deviceJson);
+        published = publishC3HaConfig("binary_sensor", "matrix_power", payload);
+        break;
+    case 14:
+        snprintf(payload, sizeof(payload),
+                 "{\"name\":\"Indicator 1\",\"unique_id\":\"%s_indicator1\",\"state_topic\":\"%s/stats\",\"value_template\":\"{{ 'true' if value_json.indicator1 else 'false' }}\",\"payload_on\":\"true\",\"payload_off\":\"false\",\"icon\":\"mdi:numeric-1-box\",%s}",
+                 MQTT_PREFIX.c_str(), MQTT_PREFIX.c_str(), deviceJson);
+        published = publishC3HaConfig("binary_sensor", "indicator1", payload);
+        break;
+    case 15:
+        snprintf(payload, sizeof(payload),
+                 "{\"name\":\"Indicator 2\",\"unique_id\":\"%s_indicator2\",\"state_topic\":\"%s/stats\",\"value_template\":\"{{ 'true' if value_json.indicator2 else 'false' }}\",\"payload_on\":\"true\",\"payload_off\":\"false\",\"icon\":\"mdi:numeric-2-box\",%s}",
+                 MQTT_PREFIX.c_str(), MQTT_PREFIX.c_str(), deviceJson);
+        published = publishC3HaConfig("binary_sensor", "indicator2", payload);
+        break;
+    case 16:
+        snprintf(payload, sizeof(payload),
+                 "{\"name\":\"Indicator 3\",\"unique_id\":\"%s_indicator3\",\"state_topic\":\"%s/stats\",\"value_template\":\"{{ 'true' if value_json.indicator3 else 'false' }}\",\"payload_on\":\"true\",\"payload_off\":\"false\",\"icon\":\"mdi:numeric-3-box\",%s}",
+                 MQTT_PREFIX.c_str(), MQTT_PREFIX.c_str(), deviceJson);
+        published = publishC3HaConfig("binary_sensor", "indicator3", payload);
+        break;
+    case 17:
+        snprintf(payload, sizeof(payload),
+                 "{\"name\":\"Next App\",\"unique_id\":\"%s_next_app\",\"command_topic\":\"%s/nextapp\",\"payload_press\":\"1\",\"icon\":\"mdi:arrow-right-bold\",%s}",
+                 MQTT_PREFIX.c_str(), MQTT_PREFIX.c_str(), deviceJson);
+        published = publishC3HaConfig("button", "next_app", payload);
+        break;
+    case 18:
+        snprintf(payload, sizeof(payload),
+                 "{\"name\":\"Previous App\",\"unique_id\":\"%s_previous_app\",\"command_topic\":\"%s/previousapp\",\"payload_press\":\"1\",\"icon\":\"mdi:arrow-left-bold\",%s}",
+                 MQTT_PREFIX.c_str(), MQTT_PREFIX.c_str(), deviceJson);
+        published = publishC3HaConfig("button", "previous_app", payload);
+        break;
+    case 19:
+        snprintf(payload, sizeof(payload),
+                 "{\"name\":\"Dismiss Notification\",\"unique_id\":\"%s_dismiss_notification\",\"command_topic\":\"%s/notify/dismiss\",\"payload_press\":\"1\",\"icon\":\"mdi:bell-off\",%s}",
+                 MQTT_PREFIX.c_str(), MQTT_PREFIX.c_str(), deviceJson);
+        published = publishC3HaConfig("button", "dismiss_notification", payload);
+        break;
+    case 20:
+        snprintf(payload, sizeof(payload),
+                 "{\"name\":\"Brightness Lux Slope\",\"unique_id\":\"%s_brightness_lux_slope\",\"command_topic\":\"%s/brightness/slope\",\"state_topic\":\"%s/stats\",\"value_template\":\"{{ value_json.brightness_slope }}\",\"min\":0.2,\"max\":5,\"step\":0.1,\"mode\":\"slider\",\"icon\":\"mdi:chart-bell-curve\",%s}",
+                 MQTT_PREFIX.c_str(), MQTT_PREFIX.c_str(), MQTT_PREFIX.c_str(), deviceJson);
+        published = publishC3HaConfig("number", "brightness_lux_slope", payload);
+        break;
+    case 21:
+        published = clearC3HaConfig("button", "start_update");
+        break;
+    case 22:
+        snprintf(payload, sizeof(payload),
+                 "{\"name\":\"Reboot\",\"unique_id\":\"%s_reboot\",\"command_topic\":\"%s/reboot\",\"payload_press\":\"1\",\"icon\":\"mdi:restart\",%s}",
+                 MQTT_PREFIX.c_str(), MQTT_PREFIX.c_str(), deviceJson);
+        published = publishC3HaConfig("button", "reboot", payload);
+        break;
+    default:
+        c3LightHaDiscoveryPending = false;
+        if (DEBUG_MODE)
+            DEBUG_PRINTLN(F("ESP32-C3 lightweight Home Assistant discovery complete"));
+        return;
+    }
+
+    if (!published)
+        return;
+
+    if (DEBUG_MODE)
+        DEBUG_PRINTF("Published ESP32-C3 HA discovery item %u", c3LightHaDiscoveryStep + 1);
+
+    c3LightHaDiscoveryStep++;
+    c3LightHaDiscoveryLastPublish = now;
+}
+#endif
 
 MQTTManager_ &MQTTManager_::getInstance()
 {
@@ -67,10 +348,9 @@ void processMqttMessage(const String &strTopic, const String &payloadCopy)
 
     if (strTopic.equals(MQTT_PREFIX + "/doupdate"))
     {
-        if (UpdateManager.checkUpdate(true))
-        {
-            UpdateManager.updateFirmware();
-        }
+        MQTTManager.publish("update/status", "disabled");
+        if (DEBUG_MODE)
+            DEBUG_PRINTLN(F("Official firmware update disabled"));
         return;
     }
 
@@ -101,6 +381,28 @@ void processMqttMessage(const String &strTopic, const String &payloadCopy)
     if (strTopic.equals(MQTT_PREFIX + "/r2d2"))
     {
         PeripheryManager.r2d2(payloadCopy.c_str());
+        return;
+    }
+
+    if (strTopic.equals(MQTT_PREFIX + "/ld2402/calibrate"))
+    {
+        PeripheryManager.calibrateLD2402();
+        return;
+    }
+
+    if (strTopic.equals(MQTT_PREFIX + "/brightness/slope"))
+    {
+        const float requestedSlope = payloadCopy.toFloat();
+        if (requestedSlope >= 0.2f && requestedSlope <= 5.0f)
+        {
+            LDR_FACTOR = requestedSlope;
+            persistBrightnessSlope();
+            char slopeText[16];
+            snprintf(slopeText, sizeof(slopeText), "%.2f", LDR_FACTOR);
+            MQTTManager.publish("brightness/slope", slopeText);
+            if (DEBUG_MODE)
+                DEBUG_PRINTF("Brightness lux slope set to %.2f", LDR_FACTOR);
+        }
         return;
     }
 
@@ -238,10 +540,11 @@ void onButtonCommand(HAButton *sender)
     }
     else if (sender == doUpdate)
     {
-        if (UpdateManager.checkUpdate(true))
-        {
-            UpdateManager.updateFirmware();
-        }
+        MQTTManager.publish("update/status", "disabled");
+    }
+    else if (sender == ld2402Calibrate)
+    {
+        PeripheryManager.calibrateLD2402();
     }
 }
 
@@ -350,16 +653,16 @@ void onMqttMessage(const char *topic, const uint8_t *payload, uint16_t length)
     if (DEBUG_MODE)
         DEBUG_PRINTF("MQTT message received at topic %s", topic);
 
-    // Create a copy of the payload
-    char *payloadCopy = new char[length + 1];
-    memcpy(payloadCopy, payload, length);
-    payloadCopy[length] = '\0';
+    if (length >= sizeof(mqttPayloadBuffer))
+    {
+        if (DEBUG_MODE)
+            DEBUG_PRINTF("MQTT payload too large: %u bytes", length);
+        return;
+    }
 
-    // Convert to String and handle the message
-    processMqttMessage(String(topic), String(payloadCopy));
-
-    // Clean up the payload copy
-    delete[] payloadCopy;
+    memcpy(mqttPayloadBuffer, payload, length);
+    mqttPayloadBuffer[length] = '\0';
+    processMqttMessage(String(topic), String(mqttPayloadBuffer));
 }
 
 String MQTTManager_::getValueForTopic(const String &topic)
@@ -379,6 +682,14 @@ void onMqttConnected()
 
     if (DEBUG_MODE)
         DEBUG_PRINTLN(F("MQTT Connected"));
+#ifdef ESP32_C3
+    if (c3LightHaDiscoveryRequested)
+    {
+        c3LightHaDiscoveryPending = true;
+        c3LightHaDiscoveryStep = 0;
+        c3LightHaDiscoveryLastPublish = 0;
+    }
+#endif
     const char *topics[] PROGMEM = {
         "/brightness",
         "/notify/dismiss",
@@ -389,7 +700,6 @@ void onMqttConnected()
         "/previousapp",
         "/nextapp",
         "/doupdate",
-        "/nextapp",
         "/apps",
         "/power",
         "/sleep",
@@ -403,7 +713,9 @@ void onMqttConnected()
         "/sound",
         "/rtttl",
         "/sendscreen",
-        "/r2d2"};
+        "/r2d2",
+        "/ld2402/calibrate",
+        "/brightness/slope"};
     for (const char *topic : topics)
     {
         if (DEBUG_MODE)
@@ -418,22 +730,25 @@ void onMqttConnected()
         if (DEBUG_MODE)
             Serial.printf("Subscribed to topic %s\n", topic.c_str());
     }
+    topicsToSubscribe.clear();
 
-    delay(200);
-    if (HA_DISCOVERY)
+      delay(200);
+      if (HA_DISCOVERY)
     {
         myOwnID->setValue(MQTT_PREFIX.c_str());
         version->setValue(VERSION);
     }
 
+#ifndef ESP32_C3
     MQTTManager.publish("stats/effects", DisplayManager.getEffectNames().c_str());
     MQTTManager.publish("stats/transitions", DisplayManager.getTransitionNames().c_str());
     if (!HA_DISCOVERY)
     {
         MQTTManager.publish("stats/device", "online");
     }
-    connected = true;
-}
+#endif
+      connected = true;
+  }
 
 bool MQTTManager_::subscribe(const char *topic)
 {
@@ -463,6 +778,12 @@ bool MQTTManager_::isConnected()
 
 void connect()
 {
+    if (MQTT_HOST == "")
+    {
+        if (DEBUG_MODE)
+            DEBUG_PRINTLN(F("MQTT disabled: host is empty"));
+        return;
+    }
 
     mqtt.onMessage(onMqttMessage);
     mqtt.onConnected(onMqttConnected);
@@ -490,8 +811,12 @@ void connect()
 
 void MQTTManager_::sendStats()
 {
+    if (MQTT_HOST == "" || !mqtt.isConnected())
+    {
+        return;
+    }
 
-    if (HA_DISCOVERY && mqtt.isConnected())
+    if (HA_DISCOVERY)
     {
         char buffer[8];
 #ifdef ULANZI
@@ -506,8 +831,12 @@ void MQTTManager_::sendStats()
             humidity->setValue(buffer);
         }
 
-        snprintf(buffer, 5, "%.0f", CURRENT_LUX);
+        snprintf(buffer, sizeof(buffer), "%.0f", CURRENT_LUX);
         illuminance->setValue(buffer);
+        ld2402Presence->setState(LD2402_AVAILABLE && LD2402_PRESENCE, false);
+        ld2402Motion->setValue(ld2402MotionText());
+        snprintf(buffer, sizeof(buffer), "%u", LD2402_DISTANCE_CM);
+        ld2402Distance->setValue(buffer);
         BriMode->setState(AUTO_BRIGHTNESS, false);
         Matrix->setBrightness(BRIGHTNESS);
         Matrix->setState(!MATRIX_OFF, false);
@@ -532,11 +861,47 @@ void MQTTManager_::sendStats()
         transition->setState(AUTO_TRANSITION, false);
         ipAddr->setValue(ServerManager.myIP.toString().c_str());
     }
-    publish(StatsTopic, DisplayManager.getStats().c_str());
-}
+    char luxBuffer[16];
+    snprintf(luxBuffer, sizeof(luxBuffer), "%.3f", CURRENT_LUX);
+    publish("stats/lux", luxBuffer);
+    StaticJsonDocument<192> ld2402Doc;
+    ld2402Doc["available"] = LD2402_AVAILABLE;
+    ld2402Doc["presence"] = LD2402_PRESENCE;
+    ld2402Doc["motion"] = ld2402MotionText();
+    ld2402Doc["distance"] = LD2402_DISTANCE_CM;
+    ld2402Doc["calibration"] = PeripheryManager.getLD2402CalibrationState();
+    ld2402Doc["lux"] = serialized(luxBuffer);
+      char ld2402Json[192];
+      serializeJson(ld2402Doc, ld2402Json, sizeof(ld2402Json));
+      publish("ld2402/status", ld2402Json);
+#ifdef ESP32_C3
+      const unsigned long now = millis();
+      if (now - c3LastFullStatsPublish >= MQTT_C3_FULL_STATS_INTERVAL)
+      {
+          c3LastFullStatsPublish = now;
+          char statsBuffer[512];
+          DisplayManager.getStats(statsBuffer, sizeof(statsBuffer));
+          publish(StatsTopic, statsBuffer);
+      }
+#else
+      char statsBuffer[512];
+      DisplayManager.getStats(statsBuffer, sizeof(statsBuffer));
+      publish(StatsTopic, statsBuffer);
+#endif
+  }
 
 void MQTTManager_::setup()
 {
+
+#ifdef ESP32_C3
+    if (HA_DISCOVERY)
+    {
+        if (DEBUG_MODE)
+            DEBUG_PRINTLN(F("ESP32-C3: using lightweight Home Assistant discovery"));
+        c3LightHaDiscoveryRequested = true;
+        HA_DISCOVERY = false;
+    }
+#endif
 
     if (HA_DISCOVERY)
     {
@@ -690,6 +1055,27 @@ void MQTTManager_::setup()
         illuminance->setDeviceClass(HAluxClass);
         illuminance->setUnitOfMeasurement(HAluxUnit);
 
+        snprintf(ld2402PresenceID, sizeof(ld2402PresenceID), "%s_ld2402_presence", macStr);
+        ld2402Presence = new HABinarySensor(ld2402PresenceID);
+        ld2402Presence->setName("LD2402 Presence");
+
+        snprintf(ld2402MotionID, sizeof(ld2402MotionID), "%s_ld2402_motion", macStr);
+        ld2402Motion = new HASensor(ld2402MotionID);
+        ld2402Motion->setName("LD2402 Motion");
+        ld2402Motion->setIcon("mdi:motion-sensor");
+
+        snprintf(ld2402DistanceID, sizeof(ld2402DistanceID), "%s_ld2402_distance", macStr);
+        ld2402Distance = new HASensor(ld2402DistanceID);
+        ld2402Distance->setName("LD2402 Distance");
+        ld2402Distance->setIcon("mdi:map-marker-distance");
+        ld2402Distance->setUnitOfMeasurement("cm");
+
+        snprintf(ld2402CalibrateID, sizeof(ld2402CalibrateID), "%s_ld2402_calibrate", macStr);
+        ld2402Calibrate = new HAButton(ld2402CalibrateID);
+        ld2402Calibrate->setName("LD2402 Calibrate");
+        ld2402Calibrate->setIcon("mdi:tune-variant");
+        ld2402Calibrate->onCommand(onButtonCommand);
+
         sprintf(verID, HAverID, macStr);
         version = new HASensor(verID);
         version->setName(HAverName);
@@ -732,7 +1118,16 @@ void MQTTManager_::setup()
     }
     else
     {
-        Serial.println(F("Homeassistant discovery disabled"));
+#ifdef ESP32_C3
+        if (c3LightHaDiscoveryRequested)
+        {
+            Serial.println(F("Homeassistant discovery lightweight mode"));
+        }
+        else
+#endif
+        {
+            Serial.println(F("Homeassistant discovery disabled"));
+        }
         mqtt.disableHA();
     }
 
@@ -746,6 +1141,9 @@ void MQTTManager_::tick()
         mqtt.loop();
     }
     unsigned long currentMillis_Stats = millis();
+#ifdef ESP32_C3
+    publishC3HaDiscoveryTick(currentMillis_Stats);
+#endif
     if ((currentMillis_Stats - previousMillis_Stats >= STATS_INTERVAL) && (SENSORS_STABLE))
     {
         previousMillis_Stats = currentMillis_Stats;
@@ -755,42 +1153,62 @@ void MQTTManager_::tick()
 
 void MQTTManager_::publish(const char *topic, const char *payload)
 {
+    if (!mqttHasWriteRoom())
+        return;
+
     char result[100];
     strcpy(result, MQTT_PREFIX.c_str());
     strcat(result, "/");
     strcat(result, topic);
 
-    if (!mqtt.isConnected())
-        return;
-
-    mqtt.publish(result, payload, false);
+    if (!mqtt.publish(result, payload, false))
+        stopMqttAfterWriteFailure();
 }
 
 void MQTTManager_::rawPublish(const char *prefix, const char *topic, const char *payload)
 {
-    if (!mqtt.isConnected())
+    if (!mqttHasWriteRoom())
         return;
     char result[100];
     strcpy(result, prefix);
     strcat(result, "/");
     strcat(result, topic);
-    mqtt.publish(result, payload, false);
+    if (!mqtt.publish(result, payload, false))
+        stopMqttAfterWriteFailure();
 }
 
 void MQTTManager_::setCurrentApp(String appName)
 {
-    static String lastApp = "";
+      static String lastApp = "";
 
-    if (lastApp == appName)
-        return;
+      if (lastApp == appName)
+          return;
 
-    if (DEBUG_MODE)
-        DEBUG_PRINTF("Publish current app %s", appName.c_str());
-    if (HA_DISCOVERY && mqtt.isConnected())
-        curApp->setValue(appName.c_str());
+      if (DEBUG_MODE)
+          DEBUG_PRINTF("Publish current app %s", appName.c_str());
+      if (HA_DISCOVERY && mqtt.isConnected())
+          curApp->setValue(appName.c_str());
 
-    publish("stats/currentApp", appName.c_str());
-    lastApp = appName;
+#ifdef ESP32_C3
+      const uint32_t freeHeap = ESP.getFreeHeap();
+      const uint32_t maxAllocHeap = ESP.getMaxAllocHeap();
+      static unsigned long lastCurrentAppPublish = 0;
+      if (freeHeap < MQTT_C3_CURRENT_APP_MIN_FREE_HEAP || maxAllocHeap < MQTT_C3_CURRENT_APP_MIN_MAX_ALLOC_HEAP)
+      {
+          if (DEBUG_MODE)
+              DEBUG_PRINTF("Skip current app publish on ESP32-C3: free=%lu max_alloc=%lu", freeHeap, maxAllocHeap);
+          lastApp = appName;
+          return;
+      }
+      if (millis() - lastCurrentAppPublish < 5000)
+      {
+          lastApp = appName;
+          return;
+      }
+      lastCurrentAppPublish = millis();
+#endif
+      publish("stats/currentApp", appName.c_str());
+      lastApp = appName;
 }
 
 void MQTTManager_::sendButton(byte btn, bool state)
@@ -864,15 +1282,25 @@ void MQTTManager_::setIndicatorState(uint8_t indicator, bool state, uint32_t col
 
 void MQTTManager_::beginPublish(const char *topic, unsigned int plength, boolean retained)
 {
-    mqtt.beginPublish(topic, plength, retained);
+    if (!mqttHasWriteRoom())
+        return;
+
+    if (!mqtt.beginPublish(topic, plength, retained))
+        stopMqttAfterWriteFailure();
 }
 
 void MQTTManager_::writePayload(const char *data, const uint16_t length)
 {
+    if (!mqttHasWriteRoom())
+        return;
+
     mqtt.writePayload(data, length);
 }
 
 void MQTTManager_::endPublish()
 {
+    if (!mqttHasWriteRoom())
+        return;
+
     mqtt.endPublish();
 }

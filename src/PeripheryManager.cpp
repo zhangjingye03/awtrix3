@@ -57,13 +57,19 @@ const char *message = "HELLO"; // Die Nachricht, die gesendet werden soll
 #define BUTTON_SELECT_PIN 6
 #define I2C_SCL_PIN 9
 #define I2C_SDA_PIN 8
-#define BUZZER_PIN 2
-#define RESET_PIN 3
+#define BUZZER_PIN -1
+#define RESET_PIN -1
 #ifndef LD2402_RX_PIN
 #define LD2402_RX_PIN 4
 #endif
 #ifndef LD2402_TX_PIN
-#define LD2402_TX_PIN 10
+#define LD2402_TX_PIN -1
+#endif
+#ifndef LD2402_ENABLED
+#define LD2402_ENABLED 1
+#endif
+#ifndef LD2402_ENGINEERING_MODE
+#define LD2402_ENGINEERING_MODE 1
 #endif
 #define LD2402_BAUD 115200
 #elif ESP32_S3
@@ -87,6 +93,10 @@ const char *message = "HELLO"; // Die Nachricht, die gesendet werden soll
 #define I2C_SDA_PIN 21
 #endif
 
+#define HAS_BUZZER (BUZZER_PIN >= 0)
+#define HAS_RESET_BUTTON (RESET_PIN >= 0)
+#define PLAYER_PIN (HAS_BUZZER ? BUZZER_PIN : BUTTON_SELECT_PIN)
+
 Adafruit_BME280 bme280;
 Adafruit_BMP280 bmp280;
 Adafruit_HTU21DF htu21df;
@@ -96,11 +106,22 @@ Adafruit_Sensor *ahtx0_humidity, *ahtx0_temp;
 BH1750 bh1750;
 bool bh1750Detected = false;
 
-#ifdef ESP32_C3
+#if defined(ESP32_C3) && LD2402_ENABLED
 HardwareSerial ld2402Serial(1);
 String ld2402Line;
 bool ld2402ReportedOnce = false;
 unsigned long lastLD2402Log = 0;
+uint32_t ld2402BytesReceived = 0;
+uint32_t ld2402ValidFrames = 0;
+unsigned long ld2402LastFrameAt = 0;
+bool ld2402CalibrationActive = false;
+unsigned long ld2402CalibrationStartedAt = 0;
+unsigned long ld2402CalibrationLastQueryAt = 0;
+uint16_t ld2402CalibrationProgress = 0;
+bool ld2402CalibrationSavePending = false;
+const char *ld2402CalibrationState = "idle";
+static const unsigned long LD2402_CALIBRATION_QUERY_INTERVAL_MS = 1000;
+static const unsigned long LD2402_CALIBRATION_TIMEOUT_MS = 45000;
 #endif
 
 #ifdef awtrix2_upgrade
@@ -120,21 +141,21 @@ DFMiniMp3<SoftwareSerial, Mp3Notify> dfmp3(mySoftwareSerial);
 #endif
 
 #ifdef BUZZER_ACTIVE_LOW
-MelodyPlayer player(BUZZER_PIN, 1, HIGH);
+MelodyPlayer player(PLAYER_PIN, 1, HIGH);
 #else
-MelodyPlayer player(BUZZER_PIN, 1, LOW);
+MelodyPlayer player(PLAYER_PIN, 1, LOW);
 #endif
 
 #ifdef BUTTON_ACTIVE_HIGH
 EasyButton button_left(BUTTON_UP_PIN, 35, true, false);
 EasyButton button_right(BUTTON_DOWN_PIN, 35, true, false);
 EasyButton button_select(BUTTON_SELECT_PIN, 35, true, false);
-EasyButton button_reset(RESET_PIN);
+EasyButton button_reset(HAS_RESET_BUTTON ? RESET_PIN : BUTTON_SELECT_PIN);
 #else
 EasyButton button_left(BUTTON_UP_PIN);
 EasyButton button_right(BUTTON_DOWN_PIN);
 EasyButton button_select(BUTTON_SELECT_PIN);
-EasyButton button_reset(RESET_PIN);
+EasyButton button_reset(HAS_RESET_BUTTON ? RESET_PIN : BUTTON_SELECT_PIN);
 #endif
 
 LightDependentResistor photocell(LDR_PIN,
@@ -147,8 +168,10 @@ int readIndex = 0;
 int sampleIndex = 0;
 unsigned long previousMillis_BatTempHum = 0;
 unsigned long previousMillis_LDR = 0;
+unsigned long previousMillis_SensorStatus = 0;
 const unsigned long interval_BatTempHum = 10000;
 const unsigned long interval_LDR = 100;
+const unsigned long interval_SensorStatus = 2000;
 int total = 0;
 unsigned long startTime;
 
@@ -177,16 +200,20 @@ PeripheryManager_ &PeripheryManager_::getInstance()
 // Initialize the global shared instance
 PeripheryManager_ &PeripheryManager = PeripheryManager.getInstance();
 
-#ifdef ESP32_C3
-static void setLD2402State(bool presence, uint16_t distanceCm)
+#if defined(ESP32_C3) && LD2402_ENABLED
+static void setLD2402State(bool presence, uint16_t distanceCm, int8_t movingState = -1)
 {
-    const bool changed = (LD2402_PRESENCE != presence) || (LD2402_DISTANCE_CM != distanceCm);
+    LD2402_AVAILABLE = true;
     LD2402_PRESENCE = presence;
+    LD2402_MOVING_STATE = movingState;
     LD2402_DISTANCE_CM = distanceCm;
+    ld2402ValidFrames++;
+    ld2402LastFrameAt = millis();
 
-    if (DEBUG_MODE && (changed || !ld2402ReportedOnce || millis() - lastLD2402Log >= 5000))
+    if (DEBUG_MODE && (!ld2402ReportedOnce || millis() - lastLD2402Log >= 5000))
     {
-        DEBUG_PRINTF("LD2402 presence=%s distance=%u cm", presence ? "true" : "false", distanceCm);
+        const char *motionText = movingState > 0 ? "moving" : (movingState == 0 ? "still" : "unknown");
+        DEBUG_PRINTF("LD2402 presence=%s moving=%s distance=%u cm", presence ? "true" : "false", motionText, distanceCm);
         ld2402ReportedOnce = true;
         lastLD2402Log = millis();
     }
@@ -202,9 +229,15 @@ static void parseLD2402Line(String line)
     upperLine.toUpperCase();
     if (upperLine.indexOf(F("OFF")) >= 0)
     {
-        setLD2402State(false, 0);
+        setLD2402State(false, 0, 0);
         return;
     }
+
+    int8_t movingState = -1;
+    if (upperLine.indexOf(F("MOV")) >= 0)
+        movingState = 1;
+    else if (upperLine.indexOf(F("STILL")) >= 0 || upperLine.indexOf(F("STATIC")) >= 0)
+        movingState = 0;
 
     int firstDigit = -1;
     for (int i = 0; i < line.length(); i++)
@@ -220,14 +253,290 @@ static void parseLD2402Line(String line)
         return;
 
     uint16_t distanceCm = line.substring(firstDigit).toInt();
-    setLD2402State(distanceCm > 0, distanceCm);
+    setLD2402State(distanceCm > 0, distanceCm, movingState);
+}
+
+static void handleLD2402CommandFrame(const uint8_t *frame, uint16_t expectedLength);
+
+static void parseLD2402BinaryByte(uint8_t byte)
+{
+    static uint8_t frame[160];
+    static uint16_t pos = 0;
+    static uint16_t expectedLength = 0;
+    static const uint8_t header[] = {0xF4, 0xF3, 0xF2, 0xF1};
+
+    if (pos < sizeof(header))
+    {
+        if (byte == header[pos])
+        {
+            frame[pos++] = byte;
+        }
+        else
+        {
+            pos = (byte == header[0]) ? 1 : 0;
+            if (pos == 1)
+                frame[0] = byte;
+        }
+        return;
+    }
+
+    if (pos >= sizeof(frame))
+    {
+        pos = 0;
+        expectedLength = 0;
+        return;
+    }
+
+    frame[pos++] = byte;
+
+    if (pos == 6)
+    {
+        const uint16_t payloadLength = frame[4] | (frame[5] << 8);
+        expectedLength = 4 + 2 + payloadLength + 4;
+        if (expectedLength > sizeof(frame) || payloadLength < 3)
+        {
+            pos = 0;
+            expectedLength = 0;
+        }
+        return;
+    }
+
+    if (expectedLength == 0 || pos < expectedLength)
+        return;
+
+    const bool hasValidTail = frame[expectedLength - 4] == 0xF8 &&
+                              frame[expectedLength - 3] == 0xF7 &&
+                              frame[expectedLength - 2] == 0xF6 &&
+                              frame[expectedLength - 1] == 0xF5;
+
+    if (hasValidTail)
+    {
+        const uint8_t targetState = frame[6];
+        const uint16_t distanceCm = frame[7] | (frame[8] << 8);
+        const bool presence = targetState != 0;
+        const int8_t movingState = targetState == 1 ? 1 : (targetState == 2 ? 0 : -1);
+        setLD2402State(presence, presence ? distanceCm : 0, movingState);
+    }
+
+    pos = 0;
+    expectedLength = 0;
+}
+
+static void parseLD2402CommandByte(uint8_t byte)
+{
+    static uint8_t frame[96];
+    static uint16_t pos = 0;
+    static uint16_t expectedLength = 0;
+    static const uint8_t header[] = {0xFD, 0xFC, 0xFB, 0xFA};
+
+    if (pos < sizeof(header))
+    {
+        if (byte == header[pos])
+        {
+            frame[pos++] = byte;
+        }
+        else
+        {
+            pos = (byte == header[0]) ? 1 : 0;
+            if (pos == 1)
+                frame[0] = byte;
+        }
+        return;
+    }
+
+    if (pos >= sizeof(frame))
+    {
+        pos = 0;
+        expectedLength = 0;
+        return;
+    }
+
+    frame[pos++] = byte;
+
+    if (pos == 6)
+    {
+        const uint16_t payloadLength = frame[4] | (frame[5] << 8);
+        expectedLength = 4 + 2 + payloadLength + 4;
+        if (expectedLength > sizeof(frame) || payloadLength < 2)
+        {
+            pos = 0;
+            expectedLength = 0;
+        }
+        return;
+    }
+
+    if (expectedLength == 0 || pos < expectedLength)
+        return;
+
+    const bool hasValidTail = frame[expectedLength - 4] == 0x04 &&
+                              frame[expectedLength - 3] == 0x03 &&
+                              frame[expectedLength - 2] == 0x02 &&
+                              frame[expectedLength - 1] == 0x01;
+
+    if (hasValidTail)
+        handleLD2402CommandFrame(frame, expectedLength);
+
+    pos = 0;
+    expectedLength = 0;
+}
+
+static void sendLD2402Command(const uint8_t *command, size_t length)
+{
+    ld2402Serial.write(command, length);
+    ld2402Serial.flush();
+}
+
+static void enableLD2402EngineeringMode();
+static void endLD2402ConfigMode();
+
+static void setLD2402CalibrationState(const char *state)
+{
+    if (strcmp(ld2402CalibrationState, state) == 0)
+        return;
+
+    ld2402CalibrationState = state;
+    MQTTManager.publish("ld2402/calibration", ld2402CalibrationState);
+
+    if (DEBUG_MODE)
+        DEBUG_PRINTF("LD2402 calibration state=%s", ld2402CalibrationState);
+}
+
+static void finishLD2402Calibration(const char *state)
+{
+    ld2402CalibrationActive = false;
+    ld2402CalibrationSavePending = false;
+    ld2402CalibrationProgress = 0;
+    endLD2402ConfigMode();
+    delay(50);
+    enableLD2402EngineeringMode();
+    setLD2402CalibrationState(state);
+}
+
+static void handleLD2402CommandFrame(const uint8_t *frame, uint16_t expectedLength)
+{
+    if (expectedLength < 12)
+        return;
+
+    const uint16_t commandWord = frame[6] | (frame[7] << 8);
+    const uint16_t ackStatus = frame[8] | (frame[9] << 8);
+
+    switch (commandWord)
+    {
+    case 0x0109:
+        if (!ld2402CalibrationActive)
+            return;
+
+        if (ackStatus == 0)
+        {
+            ld2402CalibrationProgress = 0;
+            setLD2402CalibrationState("running");
+        }
+        else
+        {
+            finishLD2402Calibration("failed");
+        }
+        break;
+
+    case 0x010A:
+        if (!ld2402CalibrationActive)
+            return;
+
+        if (ackStatus != 0 || expectedLength < 14)
+        {
+            finishLD2402Calibration("failed");
+            return;
+        }
+
+        ld2402CalibrationProgress = frame[10] | (frame[11] << 8);
+        if (DEBUG_MODE)
+            DEBUG_PRINTF("LD2402 calibration progress=%u%%", ld2402CalibrationProgress);
+
+        if (ld2402CalibrationProgress >= 100)
+        {
+            static const uint8_t saveParameters[] = {
+                0xFD, 0xFC, 0xFB, 0xFA, 0x02, 0x00, 0xFD, 0x00,
+                0x04, 0x03, 0x02, 0x01};
+            ld2402CalibrationSavePending = true;
+            setLD2402CalibrationState("saving");
+            sendLD2402Command(saveParameters, sizeof(saveParameters));
+        }
+        else
+        {
+            setLD2402CalibrationState("running");
+        }
+        break;
+
+    case 0x01FD:
+        if (!ld2402CalibrationActive || !ld2402CalibrationSavePending)
+            return;
+
+        if (ackStatus == 0)
+            finishLD2402Calibration("done");
+        else
+            finishLD2402Calibration("failed");
+        break;
+
+    default:
+        break;
+    }
+}
+
+static void enableLD2402EngineeringMode()
+{
+#if LD2402_ENGINEERING_MODE
+    static const uint8_t enableConfig[] = {
+        0xFD, 0xFC, 0xFB, 0xFA, 0x04, 0x00, 0xFF, 0x00,
+        0x01, 0x00, 0x04, 0x03, 0x02, 0x01};
+    static const uint8_t setEngineeringOutput[] = {
+        0xFD, 0xFC, 0xFB, 0xFA, 0x08, 0x00, 0x12, 0x00,
+        0x00, 0x00, 0x04, 0x00, 0x00, 0x00, 0x04, 0x03,
+        0x02, 0x01};
+    static const uint8_t endConfig[] = {
+        0xFD, 0xFC, 0xFB, 0xFA, 0x02, 0x00, 0xFE, 0x00,
+        0x04, 0x03, 0x02, 0x01};
+
+    sendLD2402Command(enableConfig, sizeof(enableConfig));
+    delay(50);
+    sendLD2402Command(setEngineeringOutput, sizeof(setEngineeringOutput));
+    delay(50);
+    sendLD2402Command(endConfig, sizeof(endConfig));
+    delay(50);
+
+    if (DEBUG_MODE)
+        DEBUG_PRINTLN(F("LD2402 engineering output mode requested"));
+#endif
+}
+
+static void endLD2402ConfigMode()
+{
+    static const uint8_t endConfig[] = {
+        0xFD, 0xFC, 0xFB, 0xFA, 0x02, 0x00, 0xFE, 0x00,
+        0x04, 0x03, 0x02, 0x01};
+    sendLD2402Command(endConfig, sizeof(endConfig));
+}
+
+static void enterLD2402ConfigMode()
+{
+    static const uint8_t enableConfig[] = {
+        0xFD, 0xFC, 0xFB, 0xFA, 0x04, 0x00, 0xFF, 0x00,
+        0x01, 0x00, 0x04, 0x03, 0x02, 0x01};
+    sendLD2402Command(enableConfig, sizeof(enableConfig));
 }
 
 static void pollLD2402()
 {
     while (ld2402Serial.available() > 0)
     {
-        const char c = static_cast<char>(ld2402Serial.read());
+        const uint8_t byte = static_cast<uint8_t>(ld2402Serial.read());
+        const char c = static_cast<char>(byte);
+        ld2402BytesReceived++;
+        parseLD2402BinaryByte(byte);
+        parseLD2402CommandByte(byte);
+
+#if LD2402_ENGINEERING_MODE
+        (void)c;
+        continue;
+#else
         if (c == '\r' || c == '\n')
         {
             parseLD2402Line(ld2402Line);
@@ -241,9 +550,76 @@ static void pollLD2402()
             if (ld2402Line.length() > 80)
                 ld2402Line = "";
         }
+#endif
+    }
+}
+
+static void updateLD2402Calibration()
+{
+    if (!ld2402CalibrationActive)
+        return;
+
+    const unsigned long now = millis();
+    const unsigned long elapsed = now - ld2402CalibrationStartedAt;
+
+    if (elapsed >= LD2402_CALIBRATION_TIMEOUT_MS)
+    {
+        finishLD2402Calibration("timeout");
+        return;
+    }
+
+    if (ld2402CalibrationSavePending)
+        return;
+
+    if (now - ld2402CalibrationLastQueryAt >= LD2402_CALIBRATION_QUERY_INTERVAL_MS)
+    {
+        static const uint8_t progressQuery[] = {
+            0xFD, 0xFC, 0xFB, 0xFA, 0x02, 0x00, 0x0A, 0x00,
+            0x04, 0x03, 0x02, 0x01};
+        ld2402CalibrationLastQueryAt = now;
+        sendLD2402Command(progressQuery, sizeof(progressQuery));
     }
 }
 #endif
+
+static void printSensorStatus()
+{
+    const char *motionText = LD2402_MOVING_STATE > 0 ? "moving" : (LD2402_MOVING_STATE == 0 ? "still" : "unknown");
+#if defined(ESP32_C3) && LD2402_ENABLED
+    Serial.printf("[SENSOR] LD2402 available=%s presence=%s moving=%s distance=%u cm rx_bytes=%lu valid_frames=%lu rx_pin=%d | BH1750 available=%s lux=%.3f\n",
+                  LD2402_AVAILABLE ? "true" : "false",
+                  LD2402_PRESENCE ? "true" : "false",
+                  motionText,
+                  LD2402_DISTANCE_CM,
+                  static_cast<unsigned long>(ld2402BytesReceived),
+                  static_cast<unsigned long>(ld2402ValidFrames),
+                  LD2402_RX_PIN,
+                  BH1750_AVAILABLE ? "true" : "false",
+                  BH1750_AVAILABLE ? CURRENT_LUX : 0.0f);
+#else
+    Serial.printf("[SENSOR] LD2402 disabled | BH1750 available=%s lux=%.3f\n",
+                  BH1750_AVAILABLE ? "true" : "false",
+                  BH1750_AVAILABLE ? CURRENT_LUX : 0.0f);
+#endif
+}
+
+static uint8_t calculateAutoBrightness()
+{
+    if (bh1750Detected)
+    {
+        const float scaledLux = max(0.0f, CURRENT_LUX * LDR_FACTOR);
+        const float clampedLux = min(scaledLux, 1000.0f);
+        brightnessPercent = (log10f(clampedLux + 1.0f) / log10f(1001.0f)) * 100.0f;
+    }
+    else
+    {
+        brightnessPercent = (LDR_RAW * LDR_FACTOR) / 1023.0 * 100.0;
+        brightnessPercent = pow(brightnessPercent, LDR_GAMMA) / pow(100.0, LDR_GAMMA - 1);
+    }
+
+    brightnessPercent = constrain(brightnessPercent, 0.0f, 100.0f);
+    return map(static_cast<int>(brightnessPercent), 0, 100, MIN_BRIGHTNESS, MAX_BRIGHTNESS);
+}
 
 void left_button_pressed()
 {
@@ -353,7 +729,7 @@ void PeripheryManager_::playBootSound()
 {
     if (DEBUG_MODE)
         DEBUG_PRINTLN(F("Playing bootsound"));
-    if (!SOUND_ACTIVE)
+    if (!SOUND_ACTIVE || !HAS_BUZZER)
     {
         if (DEBUG_MODE)
             DEBUG_PRINTLN(F("Sound output disabled"));
@@ -395,7 +771,8 @@ void PeripheryManager_::stopSound()
     }
     else
     {
-        player.stop();
+        if (HAS_BUZZER)
+            player.stop();
     }
 }
 
@@ -413,8 +790,11 @@ void PeripheryManager_::setVolume(uint8_t vol)
     }
     else
     {
-        int scaledVol = (vol * 255) / 30;
-        player.setVolume(scaledVol);
+        if (HAS_BUZZER)
+        {
+            int scaledVol = (vol * 255) / 30;
+            player.setVolume(scaledVol);
+        }
     }
 }
 
@@ -435,7 +815,7 @@ bool PeripheryManager_::parseSound(const char *json)
 
 const char *PeripheryManager_::playRTTTLString(String rtttl)
 {
-    if (!DFPLAYER_ACTIVE && SOUND_ACTIVE)
+    if (!DFPLAYER_ACTIVE && SOUND_ACTIVE && HAS_BUZZER)
     {
         static char melodyName[64];
         Melody melody = MelodyFactory.loadRtttlString(rtttl.c_str());
@@ -449,7 +829,7 @@ const char *PeripheryManager_::playRTTTLString(String rtttl)
 
 const char *PeripheryManager_::playFromFile(String file)
 {
-    if (!SOUND_ACTIVE)
+    if (!SOUND_ACTIVE || !HAS_BUZZER)
         return "";
 
     if (DFPLAYER_ACTIVE)
@@ -470,6 +850,9 @@ const char *PeripheryManager_::playFromFile(String file)
     }
     else
     {
+        if (!HAS_BUZZER)
+            return NULL;
+
         if (DEBUG_MODE)
             DEBUG_PRINTLN(F("Playing RTTTL sound file"));
         if (LittleFS.exists("/MELODIES/" + String(file) + ".txt"))
@@ -503,7 +886,7 @@ bool PeripheryManager_::isPlaying()
     }
     else
     {
-        return player.isPlaying();
+        return HAS_BUZZER && player.isPlaying();
     }
 }
 
@@ -513,7 +896,8 @@ void PeripheryManager_::setup()
         DEBUG_PRINTLN(F("Setup periphery"));
     startTime = millis();
     pinMode(LDR_PIN, INPUT);
-    pinMode(RESET_PIN, INPUT);
+    if (HAS_RESET_BUTTON)
+        pinMode(RESET_PIN, INPUT);
     if (DFPLAYER_ACTIVE)
     {
 #ifndef ESP32_C3
@@ -525,7 +909,8 @@ void PeripheryManager_::setup()
     button_left.begin();
     button_right.begin();
     button_select.begin();
-    button_reset.begin();
+    if (HAS_RESET_BUTTON)
+        button_reset.begin();
 
     if ((ROTATE_SCREEN && !SWAP_BUTTONS) || (!ROTATE_SCREEN && SWAP_BUTTONS))
     {
@@ -543,7 +928,7 @@ void PeripheryManager_::setup()
     button_select.onPressedFor(1000, select_button_pressed_long);
     button_select.onSequence(2, 300, select_button_double);
 
-#ifdef ULANZI
+#if defined(ULANZI) && HAS_RESET_BUTTON
     button_reset.onPressedFor(5000, reset_button_pressed_long);
 #endif
 
@@ -584,14 +969,16 @@ void PeripheryManager_::setup()
         bh1750.begin(BH1750::CONTINUOUS_HIGH_RES_MODE, 0x5C, &Wire))
     {
         bh1750Detected = true;
+        BH1750_AVAILABLE = true;
         if (DEBUG_MODE)
             DEBUG_PRINTLN(F("BH1750 light sensor detected"));
     }
 
-#ifdef ESP32_C3
+#if defined(ESP32_C3) && LD2402_ENABLED
     ld2402Serial.begin(LD2402_BAUD, SERIAL_8N1, LD2402_RX_PIN, LD2402_TX_PIN);
     if (DEBUG_MODE)
         DEBUG_PRINTF("LD2402 UART1 enabled at %u baud, RX GPIO %d, TX GPIO %d", LD2402_BAUD, LD2402_RX_PIN, LD2402_TX_PIN);
+    enableLD2402EngineeringMode();
 #endif
 
 #ifdef awtrix2_upgrade
@@ -607,8 +994,9 @@ void PeripheryManager_::setup()
 
 void PeripheryManager_::tick()
 {
-#ifdef ESP32_C3
+#if defined(ESP32_C3) && LD2402_ENABLED
     pollLD2402();
+    updateLD2402Calibration();
 #endif
 
     if (!MenuManager.inMenu)
@@ -638,7 +1026,8 @@ void PeripheryManager_::tick()
         button_right.read();
     }
 
-    button_reset.read();
+    if (HAS_RESET_BUTTON)
+        button_reset.read();
 
     unsigned long currentMillis_BatTempHum = millis();
     if (currentMillis_BatTempHum - previousMillis_BatTempHum >= interval_BatTempHum)
@@ -723,12 +1112,83 @@ void PeripheryManager_::tick()
         }
         if (AUTO_BRIGHTNESS && !MATRIX_OFF)
         {
-            brightnessPercent = (LDR_RAW * LDR_FACTOR) / 1023.0 * 100.0;
-            brightnessPercent = pow(brightnessPercent, LDR_GAMMA) / pow(100.0, LDR_GAMMA - 1);
-            BRIGHTNESS = map(brightnessPercent, 0, 100, MIN_BRIGHTNESS, MAX_BRIGHTNESS);
-            DisplayManager.setBrightness(BRIGHTNESS);
+            const uint8_t autoBrightness = calculateAutoBrightness();
+            if (abs(static_cast<int>(autoBrightness) - BRIGHTNESS) >= 2)
+            {
+                BRIGHTNESS = autoBrightness;
+                DisplayManager.setBrightness(BRIGHTNESS);
+            }
         }
     }
+
+    unsigned long currentMillis_SensorStatus = millis();
+    if (currentMillis_SensorStatus - previousMillis_SensorStatus >= interval_SensorStatus)
+    {
+        previousMillis_SensorStatus = currentMillis_SensorStatus;
+        printSensorStatus();
+    }
+}
+
+void PeripheryManager_::pollStartupSensors(uint16_t timeoutMs)
+{
+#if defined(ESP32_C3) && LD2402_ENABLED
+    const unsigned long start = millis();
+    while (!LD2402_AVAILABLE && millis() - start < timeoutMs)
+    {
+        pollLD2402();
+        delay(1);
+    }
+#else
+    (void)timeoutMs;
+#endif
+}
+
+const char *PeripheryManager_::calibrateLD2402()
+{
+#if defined(ESP32_C3) && LD2402_ENABLED
+    static const uint8_t startAutoThreshold[] = {
+        0xFD, 0xFC, 0xFB, 0xFA, 0x08, 0x00, 0x09, 0x00,
+        0x1E, 0x00, 0x14, 0x00, 0x1E, 0x00, 0x04, 0x03,
+        0x02, 0x01};
+
+    if (!LD2402_AVAILABLE)
+    {
+        setLD2402CalibrationState("unavailable");
+        return ld2402CalibrationState;
+    }
+
+    if (ld2402CalibrationActive)
+    {
+        setLD2402CalibrationState("busy");
+        return ld2402CalibrationState;
+    }
+
+    enterLD2402ConfigMode();
+    delay(50);
+    sendLD2402Command(startAutoThreshold, sizeof(startAutoThreshold));
+
+    ld2402CalibrationActive = true;
+    ld2402CalibrationStartedAt = millis();
+    ld2402CalibrationLastQueryAt = 0;
+    ld2402CalibrationProgress = 0;
+    ld2402CalibrationSavePending = false;
+    setLD2402CalibrationState("started");
+
+    if (DEBUG_MODE)
+        DEBUG_PRINTLN(F("LD2402 automatic threshold calibration requested"));
+    return ld2402CalibrationState;
+#else
+    return "unavailable";
+#endif
+}
+
+const char *PeripheryManager_::getLD2402CalibrationState() const
+{
+#if defined(ESP32_C3) && LD2402_ENABLED
+    return ld2402CalibrationState;
+#else
+    return "unavailable";
+#endif
 }
 
 unsigned long long PeripheryManager_::readUptime()
@@ -754,7 +1214,7 @@ unsigned long long PeripheryManager_::readUptime()
 
 void PeripheryManager_::r2d2(const char *msg)
 {
-#ifdef ULANZI
+#if defined(ULANZI) && HAS_BUZZER
     for (int i = 0; msg[i] != '\0'; i++)
     {
         char c = msg[i];

@@ -1644,10 +1644,10 @@ void DisplayManager_::updateAppVector(const char *json)
   doc.clear();
 }
 
-String DisplayManager_::getStats()
+size_t DisplayManager_::getStats(char *buffer, size_t bufferSize)
 {
   StaticJsonDocument<1024> doc;
-  char buffer[20];
+  char valueBuffer[20];
 
 #if defined(awtrix2_upgrade) || defined(ESP32_C3)
   doc[F("type")] = 1;
@@ -1659,9 +1659,12 @@ String DisplayManager_::getStats()
   doc[LuxKey] = static_cast<int>(CURRENT_LUX);
   doc[LDRRawKey] = LDR_RAW;
   doc[F("ld2402_presence")] = LD2402_PRESENCE;
+  doc[F("ld2402_motion")] = LD2402_MOVING_STATE > 0 ? "moving" : (LD2402_MOVING_STATE == 0 ? "still" : "unknown");
   doc[F("ld2402_distance")] = LD2402_DISTANCE_CM;
   doc[RamKey] = ESP.getFreeHeap() + ESP.getFreePsram();
   doc[BrightnessKey] = BRIGHTNESS;
+  snprintf(valueBuffer, sizeof(valueBuffer), "%.2f", LDR_FACTOR);
+  doc[F("brightness_slope")] = serialized(valueBuffer);
   if (SENSOR_READING)
   {
     double formattedTemp = roundToDecimalPlaces(CURRENT_TEMP, TEMP_DECIMAL_PLACES);
@@ -1679,7 +1682,49 @@ String DisplayManager_::getStats()
   doc[F("uid")] = uniqueID;
   doc[F("matrix")] = !MATRIX_OFF;
   doc[IpAddrKey] = WiFi.localIP();
+  return serializeJson(doc, buffer, bufferSize);
+}
+
+String DisplayManager_::getStats()
+{
   String jsonString;
+  jsonString.reserve(384);
+  StaticJsonDocument<1024> doc;
+  char valueBuffer[20];
+
+#if defined(awtrix2_upgrade) || defined(ESP32_C3)
+  doc[F("type")] = 1;
+#else
+  doc[BatKey] = BATTERY_PERCENT;
+  doc[BatRawKey] = BATTERY_RAW;
+  doc[F("type")] = 0;
+#endif
+  doc[LuxKey] = static_cast<int>(CURRENT_LUX);
+  doc[LDRRawKey] = LDR_RAW;
+  doc[F("ld2402_presence")] = LD2402_PRESENCE;
+  doc[F("ld2402_motion")] = LD2402_MOVING_STATE > 0 ? "moving" : (LD2402_MOVING_STATE == 0 ? "still" : "unknown");
+  doc[F("ld2402_distance")] = LD2402_DISTANCE_CM;
+  doc[RamKey] = ESP.getFreeHeap() + ESP.getFreePsram();
+  doc[BrightnessKey] = BRIGHTNESS;
+  snprintf(valueBuffer, sizeof(valueBuffer), "%.2f", LDR_FACTOR);
+  doc[F("brightness_slope")] = serialized(valueBuffer);
+  if (SENSOR_READING)
+  {
+    double formattedTemp = roundToDecimalPlaces(CURRENT_TEMP, TEMP_DECIMAL_PLACES);
+    doc[TempKey] = formattedTemp;
+    doc[HumKey] = static_cast<uint8_t>(CURRENT_HUM);
+  }
+  doc[UpTimeKey] = PeripheryManager.readUptime();
+  doc[SignalStrengthKey] = WiFi.RSSI();
+  doc[MessagesKey] = RECEIVED_MESSAGES;
+  doc[VersionKey] = VERSION;
+  doc[F("indicator1")] = ui->indicator1State;
+  doc[F("indicator2")] = ui->indicator2State;
+  doc[F("indicator3")] = ui->indicator3State;
+  doc[F("app")] = CURRENT_APP;
+  doc[F("uid")] = uniqueID;
+  doc[F("matrix")] = !MATRIX_OFF;
+  doc[IpAddrKey] = WiFi.localIP();
   serializeJson(doc, jsonString);
   return jsonString;
 }

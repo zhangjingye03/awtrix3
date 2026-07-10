@@ -55,6 +55,7 @@ public:
     void updateAppVector(const char *json);
     void setMatrixLayout(int layout);
     void setAppTime(long duration);
+    size_t getStats(char *buffer, size_t bufferSize);
     String getAppsAsJson();
     String getStats();
     String getSettings();

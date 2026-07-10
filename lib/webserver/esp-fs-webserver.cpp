@@ -121,8 +121,13 @@ bool FSWebServer::begin( int port,const char *path)
     // - second callback handles file upload at that location
     webserver->on("/edit", HTTP_POST, std::bind(&FSWebServer::replyOK, this), authMiddleware(std::bind(&FSWebServer::handleFileUpload, this)));
 
-    // OTA update via webbrowser
+    // OTA update via webbrowser. On ESP32-C3 this is also our firewall-friendly
+    // OTA path because ArduinoOTA/espota needs inbound TCP to the PC.
+#ifdef ESP32_C3
+    m_httpUpdater.setup(webserver);
+#else
     m_httpUpdater.setup(webserver, authUser, authPass);
+#endif
 
     webserver->enableCORS(true);
 

@@ -34,6 +34,95 @@ FSWebServer mws(LittleFS, server);
 // Erstelle eine Server-Instanz
 WiFiServer TCPserver(8080);
 
+static bool webOtaSucceeded = false;
+static String webOtaError;
+
+static void sendJsonString(WebServerClass *webserver, const String &json)
+{
+    webserver->send(200, F("application/json"), json);
+}
+
+void setupWebOtaHandler()
+{
+    server.on(
+        "/api/webota", HTTP_POST,
+        []()
+        {
+            if (webOtaSucceeded && !Update.hasError())
+            {
+                server.client().setNoDelay(true);
+                server.send(200, F("text/plain"), F("OK"));
+                delay(250);
+                ESP.restart();
+            }
+            else
+            {
+                String message = F("OTA failed");
+                if (webOtaError.length())
+                {
+                    message += F(": ");
+                    message += webOtaError;
+                }
+                server.send(500, F("text/plain"), message);
+            }
+        },
+        []()
+        {
+            HTTPUpload &upload = server.upload();
+            if (upload.status == UPLOAD_FILE_START)
+            {
+                webOtaSucceeded = false;
+                webOtaError = "";
+                DEBUG_PRINTF("Web OTA start: %s", upload.filename.c_str());
+                DisplayManager.clear();
+                DisplayManager.resetTextColor();
+                DisplayManager.printText(0, 6, "OTA", true, true);
+                DisplayManager.show();
+
+                uint32_t maxSketchSpace = (ESP.getFreeSketchSpace() - 0x1000) & 0xFFFFF000;
+                if (!Update.begin(maxSketchSpace, U_FLASH))
+                {
+                    StreamString error;
+                    Update.printError(error);
+                    webOtaError = error.c_str();
+                    DEBUG_PRINTF("Web OTA begin failed: %s", webOtaError.c_str());
+                }
+            }
+            else if (upload.status == UPLOAD_FILE_WRITE)
+            {
+                if (!webOtaError.length() && Update.write(upload.buf, upload.currentSize) != upload.currentSize)
+                {
+                    StreamString error;
+                    Update.printError(error);
+                    webOtaError = error.c_str();
+                    DEBUG_PRINTF("Web OTA write failed: %s", webOtaError.c_str());
+                }
+            }
+            else if (upload.status == UPLOAD_FILE_END)
+            {
+                if (!webOtaError.length() && Update.end(true))
+                {
+                    webOtaSucceeded = true;
+                    DEBUG_PRINTF("Web OTA success: %u bytes", upload.totalSize);
+                }
+                else if (!webOtaError.length())
+                {
+                    StreamString error;
+                    Update.printError(error);
+                    webOtaError = error.c_str();
+                    DEBUG_PRINTF("Web OTA end failed: %s", webOtaError.c_str());
+                }
+            }
+            else if (upload.status == UPLOAD_FILE_ABORTED)
+            {
+                Update.end();
+                webOtaError = F("aborted");
+                DEBUG_PRINTLN(F("Web OTA aborted"));
+            }
+            delay(0);
+        });
+}
+
 // The getter for the instantiated singleton instance
 ServerManager_ &ServerManager_::getInstance()
 {
@@ -149,7 +238,7 @@ void addHandler()
             mws.webserver->send(500, F("text/plain"), F("FAILED"));
         } });
     mws.addHandler("/api/apps", HTTP_GET, []()
-                   { mws.webserver->send_P(200, "application/json", DisplayManager.getAppsWithIcon().c_str()); });
+                   { String json = DisplayManager.getAppsWithIcon(); sendJsonString(mws.webserver, json); });
     mws.addHandler("/api/settings", HTTP_POST, []()
                    { DisplayManager.setNewSettings(mws.webserver->arg("plain").c_str()); mws.webserver->send(200,F("text/plain"),F("OK")); });
     mws.addHandler("/api/erase", HTTP_ANY, []()
@@ -159,7 +248,7 @@ void addHandler()
     mws.addHandler("/api/reorder", HTTP_POST, []()
                    { DisplayManager.reorderApps(mws.webserver->arg("plain").c_str()); mws.webserver->send(200,F("text/plain"),F("OK")); });
     mws.addHandler("/api/settings", HTTP_GET, []()
-                   { mws.webserver->send_P(200, "application/json", DisplayManager.getSettings().c_str()); });
+                   { String json = DisplayManager.getSettings(); sendJsonString(mws.webserver, json); });
     mws.addHandler("/api/custom", HTTP_POST, []()
                    { 
                     if (DisplayManager.parseCustomPage(mws.webserver->arg("name"),mws.webserver->arg("plain").c_str(),false)){
@@ -168,9 +257,13 @@ void addHandler()
                         mws.webserver->send(500,F("text/plain"),F("ErrorParsingJson")); 
                     } });
     mws.addHandler("/api/stats", HTTP_GET, []()
-                   { mws.webserver->send_P(200, "application/json", DisplayManager.getStats().c_str()); });
+                   {
+                    char statsBuffer[512];
+                    DisplayManager.getStats(statsBuffer, sizeof(statsBuffer));
+                    mws.webserver->send(200, F("application/json"), statsBuffer);
+                   });
     mws.addHandler("/api/screen", HTTP_GET, []()
-                   { mws.webserver->send_P(200, "application/json", DisplayManager.ledsAsJson().c_str()); });
+                   { String json = DisplayManager.ledsAsJson(); sendJsonString(mws.webserver, json); });
     mws.addHandler("/api/indicator1", HTTP_POST, []()
                    { 
                     if (DisplayManager.indicatorParser(1,mws.webserver->arg("plain").c_str())){
@@ -249,6 +342,7 @@ void ServerManager_::setup()
         mws.addOption("Auth Password", AUTH_PASS);
         mws.addHandler("/save", HTTP_POST, saveHandler);
         addHandler();
+        setupWebOtaHandler();
         udp.begin(localUdpPort);
         if (DEBUG_MODE)
             DEBUG_PRINTLN(F("Webserver loaded"));

@@ -70,6 +70,12 @@ void setup()
   loadSettings();
   PeripheryManager.setup();
   ServerManager.loadSettings();
+#ifdef ESP32_C3
+  if (HA_DISCOVERY)
+  {
+    DEBUG_PRINTLN(F("ESP32-C3: MQTT manager will use lightweight Home Assistant discovery"));
+  }
+#endif
   DisplayManager.setup();
   DisplayManager.HSVtext(9, 6, VERSION, true, 0);
   delay(500);
@@ -83,6 +89,14 @@ void setup()
     UpdateManager.setup();
     DisplayManager.startArtnet();
     StopTask = true;
+    PeripheryManager.pollStartupSensors(800);
+    String sensorStatus = "LD ";
+    sensorStatus += LD2402_AVAILABLE ? "OK" : "--";
+    sensorStatus += " BH ";
+    sensorStatus += BH1750_AVAILABLE ? "OK" : "--";
+    DisplayManager.HSVtext(0, 6, sensorStatus.c_str(), true, 0);
+    delay(900);
+
     float x = 4;
     String textForDisplay = "AWTRIX   " + ServerManager.myIP.toString();
 

@@ -35,6 +35,9 @@ public:
     static PeripheryManager_ &getInstance();
     void setup();
     void tick();
+    void pollStartupSensors(uint16_t timeoutMs);
+    const char *calibrateLD2402();
+    const char *getLD2402CalibrationState() const;
     void playBootSound();
     const char *playFromFile(String file);
     const char *playRTTTLString(String rtttl);
