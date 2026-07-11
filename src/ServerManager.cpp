@@ -35,7 +35,27 @@ FSWebServer mws(LittleFS, server);
 WiFiServer TCPserver(8080);
 
 static bool webOtaSucceeded = false;
+static bool webOtaStarted = false;
+static size_t webOtaBytesWritten = 0;
 static String webOtaError;
+
+static bool finalizeWebOta()
+{
+    if (webOtaSucceeded || webOtaError.length() || !webOtaStarted || !webOtaBytesWritten)
+        return webOtaSucceeded;
+
+    if (Update.end(true))
+    {
+        webOtaSucceeded = true;
+        DEBUG_PRINTF("Web OTA success: %u bytes", webOtaBytesWritten);
+        return true;
+    }
+
+    StreamString error;
+    Update.printError(error);
+    webOtaError = error.c_str();
+    return false;
+}
 
 static void sendJsonString(WebServerClass *webserver, const String &json)
 {
@@ -48,6 +68,8 @@ void setupWebOtaHandler()
         "/api/webota", HTTP_POST,
         []()
         {
+            // Some ESP32 WebServer versions invoke the request handler without UPLOAD_FILE_END.
+            finalizeWebOta();
             if (webOtaSucceeded && !Update.hasError())
             {
                 server.client().setNoDelay(true);
@@ -72,6 +94,8 @@ void setupWebOtaHandler()
             if (upload.status == UPLOAD_FILE_START)
             {
                 webOtaSucceeded = false;
+                webOtaStarted = true;
+                webOtaBytesWritten = 0;
                 webOtaError = "";
                 DEBUG_PRINTF("Web OTA start: %s", upload.filename.c_str());
                 DisplayManager.clear();
@@ -79,8 +103,7 @@ void setupWebOtaHandler()
                 DisplayManager.printText(0, 6, "OTA", true, true);
                 DisplayManager.show();
 
-                uint32_t maxSketchSpace = (ESP.getFreeSketchSpace() - 0x1000) & 0xFFFFF000;
-                if (!Update.begin(maxSketchSpace, U_FLASH))
+                if (!Update.begin(UPDATE_SIZE_UNKNOWN, U_FLASH))
                 {
                     StreamString error;
                     Update.printError(error);
@@ -90,7 +113,11 @@ void setupWebOtaHandler()
             }
             else if (upload.status == UPLOAD_FILE_WRITE)
             {
-                if (!webOtaError.length() && Update.write(upload.buf, upload.currentSize) != upload.currentSize)
+                if (!webOtaError.length() && Update.write(upload.buf, upload.currentSize) == upload.currentSize)
+                {
+                    webOtaBytesWritten += upload.currentSize;
+                }
+                else if (!webOtaError.length())
                 {
                     StreamString error;
                     Update.printError(error);
@@ -100,22 +127,12 @@ void setupWebOtaHandler()
             }
             else if (upload.status == UPLOAD_FILE_END)
             {
-                if (!webOtaError.length() && Update.end(true))
-                {
-                    webOtaSucceeded = true;
-                    DEBUG_PRINTF("Web OTA success: %u bytes", upload.totalSize);
-                }
-                else if (!webOtaError.length())
-                {
-                    StreamString error;
-                    Update.printError(error);
-                    webOtaError = error.c_str();
-                    DEBUG_PRINTF("Web OTA end failed: %s", webOtaError.c_str());
-                }
+                finalizeWebOta();
             }
             else if (upload.status == UPLOAD_FILE_ABORTED)
             {
                 Update.end();
+                webOtaStarted = false;
                 webOtaError = F("aborted");
                 DEBUG_PRINTLN(F("Web OTA aborted"));
             }

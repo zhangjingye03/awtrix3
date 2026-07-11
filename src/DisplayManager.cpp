@@ -1665,6 +1665,9 @@ size_t DisplayManager_::getStats(char *buffer, size_t bufferSize)
   doc[BrightnessKey] = BRIGHTNESS;
   snprintf(valueBuffer, sizeof(valueBuffer), "%.2f", LDR_FACTOR);
   doc[F("brightness_slope")] = serialized(valueBuffer);
+  doc[F("auto_brightness")] = AUTO_BRIGHTNESS;
+  doc[F("auto_transition")] = AUTO_TRANSITION;
+  doc[F("transition_effect")] = TRANS_EFFECT;
   if (SENSOR_READING)
   {
     double formattedTemp = roundToDecimalPlaces(CURRENT_TEMP, TEMP_DECIMAL_PLACES);
@@ -1708,6 +1711,9 @@ String DisplayManager_::getStats()
   doc[BrightnessKey] = BRIGHTNESS;
   snprintf(valueBuffer, sizeof(valueBuffer), "%.2f", LDR_FACTOR);
   doc[F("brightness_slope")] = serialized(valueBuffer);
+  doc[F("auto_brightness")] = AUTO_BRIGHTNESS;
+  doc[F("auto_transition")] = AUTO_TRANSITION;
+  doc[F("transition_effect")] = TRANS_EFFECT;
   if (SENSOR_READING)
   {
     double formattedTemp = roundToDecimalPlaces(CURRENT_TEMP, TEMP_DECIMAL_PLACES);

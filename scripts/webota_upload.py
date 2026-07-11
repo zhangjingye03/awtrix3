@@ -49,8 +49,8 @@ def _post_firmware(host, port, path, firmware_path):
     try:
         conn.request("POST", path, body=body, headers=headers)
         response = conn.getresponse()
-        response.read()
-        return response.status
+        response_body = response.read().decode("utf-8", "replace")
+        return response.status, response_body
     finally:
         conn.close()
 
@@ -61,8 +61,12 @@ def webota_upload(source, target, env):
     print(f"Uploading {firmware_path} to http://{host}:{port}{path}")
 
     try:
-        status = _post_firmware(host, port, path, firmware_path)
+        status, response_body = _post_firmware(host, port, path, firmware_path)
         print(f"HTTP OTA response status: {status}")
+        if response_body:
+            print(f"HTTP OTA response: {response_body}")
+        if not 200 <= status < 300:
+            return 1
     except Exception as exc:
         # The ESP often reboots before the HTTP client receives the final page.
         print(f"HTTP OTA connection ended during reboot: {exc}")

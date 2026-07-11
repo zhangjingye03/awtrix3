@@ -38,6 +38,30 @@ It is important to note that all the logic for managing the content displayed in
 Join the thousands of satisfied awtrix users who have already chosen Awtrix 2 and AWTRIX 3 and experience the difference today! 
 
 
+# ESP32-C3 And Fork Changes
+This fork includes practical support for self-built ESP32-C3 based AWTRIX devices and related custom hardware changes.
+
+Current ESP32-C3 specific support includes:
+- FastLED-based WS2812 matrix output via `esp32-c3-fastled`
+- BH1750 lux sensor integration for automatic brightness
+- HLK-LD2402 UART integration for presence, motion, and distance
+- MQTT publishing for lux, presence, motion, distance, and calibration status
+- Lightweight Home Assistant MQTT discovery for ESP32-C3
+- HTTP-based OTA upload support for custom builds
+
+Recommended PlatformIO environments:
+- `esp32-c3-fastled`: main ESP32-C3 firmware build
+- `esp32-c3-fastled-ota`: ESP OTA upload target
+- `esp32-c3-fastled-webota`: HTTP OTA upload target
+
+Notes:
+- FastLED `3.10.x` is used for ESP32-C3 matrix compatibility and reduced WS2812 flicker.
+- LD2402 engineering output is used for live presence, motion, and distance parsing.
+- LD2402 calibration follows the module command flow: start auto-threshold generation, query progress, save parameters, and restore engineering mode.
+- ESP32-C3 pin mapping is defined for buttons, I2C, and buzzer; DFPlayer MP3 modules are not supported on ESP32-C3.
+- AHTX0 temperature/humidity sensors are auto-detected.
+- Battery telemetry and related apps remain Ulanzi-specific.
+
 # 🌟[NEW!] AWTRIX App🌟
 Take your Awtrix experience to the next level with the mobile app, tailored for convenience and full control.
 
@@ -86,36 +110,6 @@ https://flows.blueforcer.de/
 - Integrated filebrowser
 - No cloud 
 - No telemetry
-
-# Hardware Notes
-- ESP32-C3 builds are supported via PlatformIO, including the `esp32-c3-fastled` environment for WS2812 matrix setups.
-- ESP32-C3 pin mapping is defined for buttons, I2C, and buzzer; DFPlayer MP3 modules are not supported on ESP32-C3.
-- FastLED `3.10.x` is used for ESP32-C3 matrix compatibility and reduced display flicker on WS2812 panels.
-- AHTX0 temperature/humidity sensors are auto-detected.
-- BH1750 ambient light sensors are supported and can drive automatic brightness on ESP32-C3 builds.
-- HLK-LD2402 presence radar is supported on ESP32-C3 over UART, including MQTT/HA reporting and MQTT-triggered automatic threshold calibration.
-- Battery telemetry and related apps are only enabled on Ulanzi hardware.
-
-# ESP32-C3 Support
-This repository includes practical support for self-built ESP32-C3 based AWTRIX devices.
-
-Current ESP32-C3 specific support includes:
-- FastLED-based WS2812 matrix output
-- BH1750 lux sensor integration
-- HLK-LD2402 UART integration
-- MQTT publishing for lux, presence, motion, distance, and calibration status
-- Lightweight Home Assistant MQTT discovery for ESP32-C3
-- HTTP-based OTA upload support for custom builds
-
-Recommended PlatformIO environments:
-- `esp32-c3-fastled`: main ESP32-C3 firmware build
-- `esp32-c3-fastled-ota`: ESP OTA upload target
-- `esp32-c3-fastled-webota`: HTTP OTA upload target
-
-Notes:
-- LD2402 engineering output is used for live presence, motion, and distance parsing.
-- LD2402 calibration follows the module command flow: start auto-threshold generation, query progress, save parameters, and restore engineering mode.
-- Some original AWTRIX features remain hardware-specific and are still more complete on the Ulanzi ESP32 targets.
 
 # Getting Started
 Starting is easy as 1-2-3

@@ -47,6 +47,7 @@ static bool c3LightHaDiscoveryRequested = false;
 static bool c3LightHaDiscoveryPending = false;
 static uint8_t c3LightHaDiscoveryStep = 0;
 static unsigned long c3LightHaDiscoveryLastPublish = 0;
+static bool c3AvailabilityWasConnected = false;
 #endif
 
 static const char *ld2402MotionText()
@@ -80,6 +81,9 @@ static bool mqttHasWriteRoom()
 static void stopMqttAfterWriteFailure()
 {
     connected = false;
+#ifdef ESP32_C3
+    c3AvailabilityWasConnected = false;
+#endif
     espClient.stop();
     if (DEBUG_MODE)
         DEBUG_PRINTLN(F("MQTT publish failed; closing client socket"));
@@ -102,21 +106,31 @@ static bool mqttPublishRetained(const char *topic, const char *payload)
 static int buildHaDeviceJson(char *buffer, size_t length)
 {
     return snprintf(buffer, length,
-                    "\"device\":{\"identifiers\":[\"%s\"],\"name\":\"%s\",\"manufacturer\":\"%s\",\"model\":\"%s\",\"sw_version\":\"%s\"}",
-                    MQTT_PREFIX.c_str(), HOSTNAME.c_str(), HAmanufacturer, HAmodel, VERSION);
+                    "\"availability_topic\":\"%s/status\",\"payload_available\":\"online\",\"payload_not_available\":\"offline\",\"device\":{\"identifiers\":[\"%s\"],\"name\":\"%s\",\"manufacturer\":\"%s\",\"model\":\"%s\",\"sw_version\":\"%s\"}",
+                    MQTT_PREFIX.c_str(), MQTT_PREFIX.c_str(), HOSTNAME.c_str(), HAmanufacturer, HAmodel, VERSION);
 }
 
 static bool publishC3HaConfig(const char *component, const char *objectId, const char *payload)
 {
-    char topic[160];
-    snprintf(topic, sizeof(topic), "%s/%s/%s_%s/config", HA_PREFIX.c_str(), component, MQTT_PREFIX.c_str(), objectId);
+    char topic[256];
+    const int length = snprintf(topic, sizeof(topic), "%s/%s/%s_%s/config", HA_PREFIX.c_str(), component, MQTT_PREFIX.c_str(), objectId);
+    if (length < 0 || static_cast<size_t>(length) >= sizeof(topic))
+    {
+        DEBUG_PRINTLN(F("HA discovery topic too long"));
+        return false;
+    }
     return mqttPublishRetained(topic, payload);
 }
 
 static bool clearC3HaConfig(const char *component, const char *objectId)
 {
-    char topic[160];
-    snprintf(topic, sizeof(topic), "%s/%s/%s_%s/config", HA_PREFIX.c_str(), component, MQTT_PREFIX.c_str(), objectId);
+    char topic[256];
+    const int length = snprintf(topic, sizeof(topic), "%s/%s/%s_%s/config", HA_PREFIX.c_str(), component, MQTT_PREFIX.c_str(), objectId);
+    if (length < 0 || static_cast<size_t>(length) >= sizeof(topic))
+    {
+        DEBUG_PRINTLN(F("HA discovery topic too long"));
+        return false;
+    }
     return mqttPublishRetained(topic, "");
 }
 
@@ -143,6 +157,34 @@ static void persistBrightnessSlope()
     }
 }
 
+static void publishC3AvailabilityIfNeeded()
+{
+    if (!mqtt.isConnected())
+    {
+        c3AvailabilityWasConnected = false;
+        return;
+    }
+
+    if (c3AvailabilityWasConnected)
+        return;
+
+    char availabilityTopic[100];
+    snprintf(availabilityTopic, sizeof(availabilityTopic), "%s/status", MQTT_PREFIX.c_str());
+    if (mqttPublishRetained(availabilityTopic, "online"))
+    {
+        c3AvailabilityWasConnected = true;
+        if (DEBUG_MODE)
+            DEBUG_PRINTLN(F("MQTT availability published: online"));
+    }
+}
+
+static void publishC3StatsNow()
+{
+    char statsBuffer[512];
+    DisplayManager.getStats(statsBuffer, sizeof(statsBuffer));
+    MQTTManager.publish("stats", statsBuffer);
+}
+
 static void publishC3HaDiscoveryTick(unsigned long now)
 {
     if (!c3LightHaDiscoveryPending || !mqtt.isConnected())
@@ -151,7 +193,7 @@ static void publishC3HaDiscoveryTick(unsigned long now)
     if (now - c3LightHaDiscoveryLastPublish < 2500)
         return;
 
-    char deviceJson[260];
+    char deviceJson[420];
     buildHaDeviceJson(deviceJson, sizeof(deviceJson));
 
     char payload[960];
@@ -239,27 +281,27 @@ static void publishC3HaDiscoveryTick(unsigned long now)
         break;
     case 13:
         snprintf(payload, sizeof(payload),
-                 "{\"name\":\"Matrix Power\",\"unique_id\":\"%s_matrix_power\",\"state_topic\":\"%s/stats\",\"value_template\":\"{{ 'true' if value_json.matrix else 'false' }}\",\"payload_on\":\"true\",\"payload_off\":\"false\",\"icon\":\"mdi:clock-digital\",%s}",
-                 MQTT_PREFIX.c_str(), MQTT_PREFIX.c_str(), deviceJson);
-        published = publishC3HaConfig("binary_sensor", "matrix_power", payload);
+                 "{\"name\":\"Matrix\",\"unique_id\":\"%s_matrix\",\"state_topic\":\"%s/stats\",\"value_template\":\"{{ 'ON' if value_json.matrix else 'OFF' }}\",\"command_topic\":\"%s/ha/matrix_power\",\"payload_on\":\"ON\",\"payload_off\":\"OFF\",\"icon\":\"mdi:clock-digital\",%s}",
+                 MQTT_PREFIX.c_str(), MQTT_PREFIX.c_str(), MQTT_PREFIX.c_str(), deviceJson);
+        published = publishC3HaConfig("switch", "matrix", payload);
         break;
     case 14:
         snprintf(payload, sizeof(payload),
-                 "{\"name\":\"Indicator 1\",\"unique_id\":\"%s_indicator1\",\"state_topic\":\"%s/stats\",\"value_template\":\"{{ 'true' if value_json.indicator1 else 'false' }}\",\"payload_on\":\"true\",\"payload_off\":\"false\",\"icon\":\"mdi:numeric-1-box\",%s}",
-                 MQTT_PREFIX.c_str(), MQTT_PREFIX.c_str(), deviceJson);
-        published = publishC3HaConfig("binary_sensor", "indicator1", payload);
+                 "{\"name\":\"Indicator 1\",\"unique_id\":\"%s_indicator1\",\"state_topic\":\"%s/stats\",\"value_template\":\"{{ 'ON' if value_json.indicator1 else 'OFF' }}\",\"command_topic\":\"%s/ha/indicator1\",\"payload_on\":\"ON\",\"payload_off\":\"OFF\",\"icon\":\"mdi:arrow-top-right-thick\",%s}",
+                 MQTT_PREFIX.c_str(), MQTT_PREFIX.c_str(), MQTT_PREFIX.c_str(), deviceJson);
+        published = publishC3HaConfig("switch", "indicator1", payload);
         break;
     case 15:
         snprintf(payload, sizeof(payload),
-                 "{\"name\":\"Indicator 2\",\"unique_id\":\"%s_indicator2\",\"state_topic\":\"%s/stats\",\"value_template\":\"{{ 'true' if value_json.indicator2 else 'false' }}\",\"payload_on\":\"true\",\"payload_off\":\"false\",\"icon\":\"mdi:numeric-2-box\",%s}",
-                 MQTT_PREFIX.c_str(), MQTT_PREFIX.c_str(), deviceJson);
-        published = publishC3HaConfig("binary_sensor", "indicator2", payload);
+                 "{\"name\":\"Indicator 2\",\"unique_id\":\"%s_indicator2\",\"state_topic\":\"%s/stats\",\"value_template\":\"{{ 'ON' if value_json.indicator2 else 'OFF' }}\",\"command_topic\":\"%s/ha/indicator2\",\"payload_on\":\"ON\",\"payload_off\":\"OFF\",\"icon\":\"mdi:arrow-right-thick\",%s}",
+                 MQTT_PREFIX.c_str(), MQTT_PREFIX.c_str(), MQTT_PREFIX.c_str(), deviceJson);
+        published = publishC3HaConfig("switch", "indicator2", payload);
         break;
     case 16:
         snprintf(payload, sizeof(payload),
-                 "{\"name\":\"Indicator 3\",\"unique_id\":\"%s_indicator3\",\"state_topic\":\"%s/stats\",\"value_template\":\"{{ 'true' if value_json.indicator3 else 'false' }}\",\"payload_on\":\"true\",\"payload_off\":\"false\",\"icon\":\"mdi:numeric-3-box\",%s}",
-                 MQTT_PREFIX.c_str(), MQTT_PREFIX.c_str(), deviceJson);
-        published = publishC3HaConfig("binary_sensor", "indicator3", payload);
+                 "{\"name\":\"Indicator 3\",\"unique_id\":\"%s_indicator3\",\"state_topic\":\"%s/stats\",\"value_template\":\"{{ 'ON' if value_json.indicator3 else 'OFF' }}\",\"command_topic\":\"%s/ha/indicator3\",\"payload_on\":\"ON\",\"payload_off\":\"OFF\",\"icon\":\"mdi:arrow-bottom-right-thick\",%s}",
+                 MQTT_PREFIX.c_str(), MQTT_PREFIX.c_str(), MQTT_PREFIX.c_str(), deviceJson);
+        published = publishC3HaConfig("switch", "indicator3", payload);
         break;
     case 17:
         snprintf(payload, sizeof(payload),
@@ -293,6 +335,37 @@ static void publishC3HaDiscoveryTick(unsigned long now)
                  "{\"name\":\"Reboot\",\"unique_id\":\"%s_reboot\",\"command_topic\":\"%s/reboot\",\"payload_press\":\"1\",\"icon\":\"mdi:restart\",%s}",
                  MQTT_PREFIX.c_str(), MQTT_PREFIX.c_str(), deviceJson);
         published = publishC3HaConfig("button", "reboot", payload);
+        break;
+    case 23:
+        snprintf(payload, sizeof(payload),
+                 "{\"name\":\"Brightness Mode\",\"unique_id\":\"%s_brightness_mode\",\"state_topic\":\"%s/stats\",\"value_template\":\"{{ 'Auto' if value_json.auto_brightness else 'Manual' }}\",\"command_topic\":\"%s/ha/brightness_mode\",\"options\":[\"Manual\",\"Auto\"],\"icon\":\"mdi:brightness-auto\",%s}",
+                 MQTT_PREFIX.c_str(), MQTT_PREFIX.c_str(), MQTT_PREFIX.c_str(), deviceJson);
+        published = publishC3HaConfig("select", "brightness_mode", payload);
+        break;
+    case 24:
+        snprintf(payload, sizeof(payload),
+                 "{\"name\":\"Transition\",\"unique_id\":\"%s_transition\",\"state_topic\":\"%s/stats\",\"value_template\":\"{{ 'ON' if value_json.auto_transition else 'OFF' }}\",\"command_topic\":\"%s/ha/transition\",\"payload_on\":\"ON\",\"payload_off\":\"OFF\",\"icon\":\"mdi:swap-horizontal\",%s}",
+                 MQTT_PREFIX.c_str(), MQTT_PREFIX.c_str(), MQTT_PREFIX.c_str(), deviceJson);
+        published = publishC3HaConfig("switch", "transition", payload);
+        break;
+    case 25:
+        snprintf(payload, sizeof(payload),
+                 "{\"name\":\"Transition Effect\",\"unique_id\":\"%s_transition_effect\",\"state_topic\":\"%s/stats\",\"value_template\":\"{{ ['Random','Slide','Dim','Zoom','Rotate','Pixelate','Curtain','Ripple','Blink','Reload','Fade'][value_json.transition_effect] }}\",\"command_topic\":\"%s/ha/transition_effect\",\"options\":[\"Random\",\"Slide\",\"Dim\",\"Zoom\",\"Rotate\",\"Pixelate\",\"Curtain\",\"Ripple\",\"Blink\",\"Reload\",\"Fade\"],\"icon\":\"mdi:auto-fix\",%s}",
+                 MQTT_PREFIX.c_str(), MQTT_PREFIX.c_str(), MQTT_PREFIX.c_str(), deviceJson);
+        published = publishC3HaConfig("select", "transition_effect", payload);
+        break;
+    // Replace the original read-only C3 entities with their controllable counterparts.
+    case 26:
+        published = clearC3HaConfig("binary_sensor", "matrix_power");
+        break;
+    case 27:
+        published = clearC3HaConfig("binary_sensor", "indicator1");
+        break;
+    case 28:
+        published = clearC3HaConfig("binary_sensor", "indicator2");
+        break;
+    case 29:
+        published = clearC3HaConfig("binary_sensor", "indicator3");
         break;
     default:
         c3LightHaDiscoveryPending = false;
@@ -405,6 +478,63 @@ void processMqttMessage(const String &strTopic, const String &payloadCopy)
         }
         return;
     }
+
+#ifdef ESP32_C3
+    if (strTopic.equals(MQTT_PREFIX + "/ha/matrix_power"))
+    {
+        DisplayManager.setPower(payloadCopy.equalsIgnoreCase("ON"));
+        publishC3StatsNow();
+        return;
+    }
+
+    if (strTopic.equals(MQTT_PREFIX + "/ha/indicator1") || strTopic.equals(MQTT_PREFIX + "/ha/indicator2") || strTopic.equals(MQTT_PREFIX + "/ha/indicator3"))
+    {
+        const bool enabled = payloadCopy.equalsIgnoreCase("ON");
+        if (strTopic.endsWith("indicator1"))
+            DisplayManager.setIndicator1State(enabled);
+        else if (strTopic.endsWith("indicator2"))
+            DisplayManager.setIndicator2State(enabled);
+        else
+            DisplayManager.setIndicator3State(enabled);
+        publishC3StatsNow();
+        return;
+    }
+
+    if (strTopic.equals(MQTT_PREFIX + "/ha/brightness_mode"))
+    {
+        AUTO_BRIGHTNESS = payloadCopy.equalsIgnoreCase("Auto");
+        if (!AUTO_BRIGHTNESS)
+            DisplayManager.setBrightness(BRIGHTNESS);
+        saveSettings();
+        publishC3StatsNow();
+        return;
+    }
+
+    if (strTopic.equals(MQTT_PREFIX + "/ha/transition"))
+    {
+        AUTO_TRANSITION = payloadCopy.equalsIgnoreCase("ON");
+        DisplayManager.setAutoTransition(AUTO_TRANSITION);
+        saveSettings();
+        publishC3StatsNow();
+        return;
+    }
+
+    if (strTopic.equals(MQTT_PREFIX + "/ha/transition_effect"))
+    {
+        static const char *const effects[] = {"Random", "Slide", "Dim", "Zoom", "Rotate", "Pixelate", "Curtain", "Ripple", "Blink", "Reload", "Fade"};
+        for (uint8_t i = 0; i < sizeof(effects) / sizeof(effects[0]); i++)
+        {
+            if (payloadCopy.equalsIgnoreCase(effects[i]))
+            {
+                TRANS_EFFECT = i;
+                saveSettings();
+                publishC3StatsNow();
+                break;
+            }
+        }
+        return;
+    }
+#endif
 
     if (strTopic.equals(MQTT_PREFIX + "/nextapp"))
     {
@@ -715,7 +845,14 @@ void onMqttConnected()
         "/sendscreen",
         "/r2d2",
         "/ld2402/calibrate",
-        "/brightness/slope"};
+        "/brightness/slope",
+        "/ha/matrix_power",
+        "/ha/indicator1",
+        "/ha/indicator2",
+        "/ha/indicator3",
+        "/ha/brightness_mode",
+        "/ha/transition",
+        "/ha/transition_effect"};
     for (const char *topic : topics)
     {
         if (DEBUG_MODE)
@@ -731,6 +868,10 @@ void onMqttConnected()
             Serial.printf("Subscribed to topic %s\n", topic.c_str());
     }
     topicsToSubscribe.clear();
+
+#ifdef ESP32_C3
+    publishC3AvailabilityIfNeeded();
+#endif
 
       delay(200);
       if (HA_DISCOVERY)
@@ -788,12 +929,18 @@ void connect()
     mqtt.onMessage(onMqttMessage);
     mqtt.onConnected(onMqttConnected);
 
+#ifdef ESP32_C3
+    static char c3AvailabilityTopic[100];
+    snprintf(c3AvailabilityTopic, sizeof(c3AvailabilityTopic), "%s/status", MQTT_PREFIX.c_str());
+    mqtt.setLastWill(c3AvailabilityTopic, "offline", true);
+#else
     if (!HA_DISCOVERY)
     {
         static char topic[50];
         snprintf(topic, sizeof(topic), "%s/stats/device", MQTT_PREFIX.c_str());
         mqtt.setLastWill(topic, "offline", false);
     }
+#endif
 
     if (MQTT_USER == "" || MQTT_PASS == "")
     {
@@ -1142,6 +1289,7 @@ void MQTTManager_::tick()
     }
     unsigned long currentMillis_Stats = millis();
 #ifdef ESP32_C3
+    publishC3AvailabilityIfNeeded();
     publishC3HaDiscoveryTick(currentMillis_Stats);
 #endif
     if ((currentMillis_Stats - previousMillis_Stats >= STATS_INTERVAL) && (SENSORS_STABLE))
@@ -1156,10 +1304,13 @@ void MQTTManager_::publish(const char *topic, const char *payload)
     if (!mqttHasWriteRoom())
         return;
 
-    char result[100];
-    strcpy(result, MQTT_PREFIX.c_str());
-    strcat(result, "/");
-    strcat(result, topic);
+    char result[256];
+    const int length = snprintf(result, sizeof(result), "%s/%s", MQTT_PREFIX.c_str(), topic);
+    if (length < 0 || static_cast<size_t>(length) >= sizeof(result))
+    {
+        DEBUG_PRINTLN(F("MQTT topic too long"));
+        return;
+    }
 
     if (!mqtt.publish(result, payload, false))
         stopMqttAfterWriteFailure();
@@ -1169,10 +1320,13 @@ void MQTTManager_::rawPublish(const char *prefix, const char *topic, const char 
 {
     if (!mqttHasWriteRoom())
         return;
-    char result[100];
-    strcpy(result, prefix);
-    strcat(result, "/");
-    strcat(result, topic);
+    char result[256];
+    const int length = snprintf(result, sizeof(result), "%s/%s", prefix, topic);
+    if (length < 0 || static_cast<size_t>(length) >= sizeof(result))
+    {
+        DEBUG_PRINTLN(F("MQTT topic too long"));
+        return;
+    }
     if (!mqtt.publish(result, payload, false))
         stopMqttAfterWriteFailure();
 }
