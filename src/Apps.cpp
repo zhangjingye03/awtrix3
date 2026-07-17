@@ -9,6 +9,7 @@
 #include <WiFi.h>
 #include "effects.h"
 #include "MQTTManager.h"
+#include "DisplayManager.h"
 #include "Overlays.h"
 #include "timer.h"
 
@@ -468,6 +469,7 @@ void ShowCustomApp(String name, FastLED_NeoMatrix *matrix, MatrixDisplayUiState 
 
     if ((ca->iconName.length() > 0) && !ca->icon)
     {
+        DisplayManager.logC3Heap("icon_open_before");
         const char *extensions[] = {".jpg", ".gif"};
         bool isGifFlags[] = {false, true};
 
@@ -482,6 +484,7 @@ void ShowCustomApp(String name, FastLED_NeoMatrix *matrix, MatrixDisplayUiState 
                 break;
             }
         }
+        DisplayManager.logC3Heap("icon_open_after");
     }
 
     bool hasIcon = ca->icon || ca->jpegDataSize > 0;
@@ -489,15 +492,19 @@ void ShowCustomApp(String name, FastLED_NeoMatrix *matrix, MatrixDisplayUiState 
     uint16_t textWidth = 0;
     if (!ca->fragments.empty())
     {
-        for (const auto &fragment : ca->fragments)
-        {
-            String replacedFragment = replacePlaceholders(fragment);
+      for (const auto &fragment : ca->fragments)
+      {
+        DisplayManager.logC3Heap("custom_width_string_before");
+        String replacedFragment = replacePlaceholders(fragment);
+        DisplayManager.logC3Heap("custom_width_string_after");
             textWidth += getTextWidth(replacedFragment.c_str(), ca->textCase);
         }
     }
     else
     {
+        DisplayManager.logC3Heap("custom_width_string_before");
         String replacedText = replacePlaceholders(ca->text);
+        DisplayManager.logC3Heap("custom_width_string_after");
         textWidth = getTextWidth(replacedText.c_str(), ca->textCase);
     }
 
@@ -528,20 +535,24 @@ void ShowCustomApp(String name, FastLED_NeoMatrix *matrix, MatrixDisplayUiState 
             }
             if (ca->isGif)
             {
+                DisplayManager.logC3Heap("gif_decode_before");
                 iconWidth = gifPlayer->playGif(x + ca->iconPosition + ca->iconOffset, y, &ca->icon, ca->currentFrame);
                 ca->currentFrame = gifPlayer->getFrame();
+                DisplayManager.logC3Heap("gif_decode_after");
             }
             else
             {
                 iconWidth = 8;
+                DisplayManager.logC3Heap("jpg_decode_before");
                 if (ca->jpegDataSize > 0)
                 {
-                    DisplayManager.drawJPG(x + ca->iconPosition + ca->iconOffset, y, ca->jpegDataBuffer, ca->jpegDataSize);
+                    DisplayManager.drawJPG(x + ca->iconPosition + ca->iconOffset, y, ca->jpegDataBuffer.data(), ca->jpegDataSize);
                 }
                 else
                 {
                     DisplayManager.drawJPG(x + ca->iconPosition + ca->iconOffset, y, ca->icon);
                 }
+                DisplayManager.logC3Heap("jpg_decode_after");
             }
             if (!noScrolling)
             {
@@ -663,7 +674,10 @@ void ShowCustomApp(String name, FastLED_NeoMatrix *matrix, MatrixDisplayUiState 
         textX = hasIcon ? 9 : 0;
     }
 
+    DisplayManager.logC3Heap("custom_text_string_before");
     String text = replacePlaceholders(ca->text);
+    DisplayManager.logC3Heap("custom_text_string_after");
+    DisplayManager.logC3Heap("custom_text_before");
 
     if (noScrolling)
     {
@@ -733,6 +747,8 @@ void ShowCustomApp(String name, FastLED_NeoMatrix *matrix, MatrixDisplayUiState 
     {
         renderFirst();
     }
+
+    DisplayManager.logC3Heap("custom_text_after");
 
     if (ca->lifeTimeEnd)
     {

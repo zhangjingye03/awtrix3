@@ -22,6 +22,7 @@
 #include <MedianFilterLib.h>
 #include <MeanFilterLib.h>
 #include <Games/GameManager.h>
+#include <math.h>
 const int buzzerPin = 2;       // Buzzer an GPIO2
 const int baudRate = 50;       // Nachrichtenübertragungsrate
 const char *message = "HELLO"; // Die Nachricht, die gesendet werden soll
@@ -172,6 +173,10 @@ unsigned long previousMillis_SensorStatus = 0;
 const unsigned long interval_BatTempHum = 10000;
 const unsigned long interval_LDR = 100;
 const unsigned long interval_SensorStatus = 2000;
+static bool hasValidTempHum = false;
+static float lastValidTemp = 0;
+static float lastValidHum = 0;
+static unsigned long lastInvalidTempHumLog = 0;
 int total = 0;
 unsigned long startTime;
 
@@ -203,12 +208,16 @@ PeripheryManager_ &PeripheryManager = PeripheryManager.getInstance();
 #if defined(ESP32_C3) && LD2402_ENABLED
 static void setLD2402State(bool presence, uint16_t distanceCm, int8_t movingState = -1)
 {
+    const bool stateChanged = !LD2402_AVAILABLE || LD2402_PRESENCE != presence || LD2402_MOVING_STATE != movingState;
     LD2402_AVAILABLE = true;
     LD2402_PRESENCE = presence;
     LD2402_MOVING_STATE = movingState;
     LD2402_DISTANCE_CM = distanceCm;
     ld2402ValidFrames++;
     ld2402LastFrameAt = millis();
+
+    if (stateChanged)
+        MQTTManager.publishLD2402State();
 
     if (DEBUG_MODE && (!ld2402ReportedOnce || millis() - lastLD2402Log >= 5000))
     {
@@ -1070,10 +1079,16 @@ void PeripheryManager_::tick()
                 ahtx0_humidity = ahtx0.getHumiditySensor();
                 ahtx0_temp = ahtx0.getTemperatureSensor();
                 sensors_event_t tempEvent, humEvent;
-                ahtx0_temp->getEvent(&tempEvent);
-                ahtx0_humidity->getEvent(&humEvent);
-                CURRENT_TEMP = tempEvent.temperature;
-                CURRENT_HUM = humEvent.relative_humidity;
+                if (ahtx0_temp->getEvent(&tempEvent) && ahtx0_humidity->getEvent(&humEvent))
+                {
+                    CURRENT_TEMP = tempEvent.temperature;
+                    CURRENT_HUM = humEvent.relative_humidity;
+                }
+                else
+                {
+                    CURRENT_TEMP = NAN;
+                    CURRENT_HUM = NAN;
+                }
                 break;
             default:
                 CURRENT_TEMP = 0;
@@ -1083,6 +1098,30 @@ void PeripheryManager_::tick()
 
             CURRENT_TEMP += TEMP_OFFSET;
             CURRENT_HUM += HUM_OFFSET;
+
+            const bool inRange = isfinite(CURRENT_TEMP) && isfinite(CURRENT_HUM) &&
+                                 CURRENT_TEMP >= -40.0f && CURRENT_TEMP <= 125.0f &&
+                                 CURRENT_HUM >= 0.0f && CURRENT_HUM <= 100.0f;
+            const bool suddenJump = hasValidTempHum &&
+                                    (fabsf(CURRENT_TEMP - lastValidTemp) > 5.0f ||
+                                     fabsf(CURRENT_HUM - lastValidHum) > 20.0f);
+
+            if (inRange && !suddenJump)
+            {
+                lastValidTemp = CURRENT_TEMP;
+                lastValidHum = CURRENT_HUM;
+                hasValidTempHum = true;
+            }
+            else if (hasValidTempHum)
+            {
+                if (DEBUG_MODE && millis() - lastInvalidTempHumLog > 60000)
+                {
+                    lastInvalidTempHumLog = millis();
+                    DEBUG_PRINTF("Ignoring invalid temp/humidity sample: temp=%.2f hum=%.2f", CURRENT_TEMP, CURRENT_HUM);
+                }
+                CURRENT_TEMP = lastValidTemp;
+                CURRENT_HUM = lastValidHum;
+            }
         }
         else
         {

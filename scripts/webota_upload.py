@@ -21,8 +21,8 @@ def _http_get(host, port, path, timeout=5):
     try:
         conn.request("GET", path)
         response = conn.getresponse()
-        response.read()
-        return response.status
+        body = response.read().decode("utf-8", "replace")
+        return response.status, body
     finally:
         conn.close()
 
@@ -71,15 +71,15 @@ def webota_upload(source, target, env):
         # The ESP often reboots before the HTTP client receives the final page.
         print(f"HTTP OTA connection ended during reboot: {exc}")
 
-    poll_path = "/update"
+    poll_path = path
     print("Waiting for device to return...")
     deadline = time.time() + 75
     while time.time() < deadline:
         time.sleep(3)
         try:
-            status = _http_get(host, port, poll_path)
-            if 200 <= status < 500:
-                print("HTTP OTA complete; device is reachable again.")
+            status, response_body = _http_get(host, port, poll_path)
+            if status == 200 and '"status":"ready"' in response_body:
+                print("HTTP OTA complete; device is ready.")
                 return 0
         except Exception:
             pass

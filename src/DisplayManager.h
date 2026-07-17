@@ -38,6 +38,7 @@ public:
     void selectButton();
     void selectButtonLong();
     void setBrightness(int);
+    void logC3Heap(const char *stage);
     bool generateNotification(uint8_t source, const char *json);
     bool generateCustomPage(const String &name, JsonObject doc, bool preventSave);
     void printText(int16_t x, int16_t y, const char *text, bool centered, byte textCase);

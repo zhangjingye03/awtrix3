@@ -48,6 +48,7 @@ Current ESP32-C3 specific support includes:
 - MQTT publishing for lux, presence, motion, distance, and calibration status
 - Lightweight Home Assistant MQTT discovery for ESP32-C3
 - HTTP-based OTA upload support for custom builds
+- Upstream-compatible MQTT CustomApps, including array-form `"draw": [...]` payloads
 
 Recommended PlatformIO environments:
 - `esp32-c3-fastled`: main ESP32-C3 firmware build
@@ -56,6 +57,10 @@ Recommended PlatformIO environments:
 
 Notes:
 - FastLED `3.10.x` is used for ESP32-C3 matrix compatibility and reduced WS2812 flicker.
+- The ESP32-C3 MQTT packet buffer is limited to 4 KB to preserve heap while accepting upstream CustomApp payloads up to 4 KB.
+- C3 CustomApps support text, `dp`, `dl`, `dt`, and named GIF icons. The draw parser uses bounded static storage to avoid frame-by-frame heap allocation.
+- Animated GIFs temporarily require roughly a 4 KB contiguous heap block; the heap is released after the active GIF page changes or is removed.
+- WS2812 matrices must use an adequately rated external 5 V supply with a common ground to the ESP32-C3. A brownout reset (`reset_reason: 9`) indicates insufficient matrix power, not a CustomApp parsing failure. Auto brightness can drive substantial LED current at high lux.
 - LD2402 engineering output is used for live presence, motion, and distance parsing.
 - LD2402 calibration follows the module command flow: start auto-threshold generation, query progress, save parameters, and restore engineering mode.
 - ESP32-C3 pin mapping is defined for buttons, I2C, and buzzer; DFPlayer MP3 modules are not supported on ESP32-C3.

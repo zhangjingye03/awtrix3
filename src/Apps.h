@@ -54,7 +54,8 @@ struct CustomApp
     bool topText = true;
     bool noScrolling = true;
     bool lifeTimeEnd = false;
-    uint8_t jpegDataBuffer[1000];
+    // Base64 JPEG icons are uncommon. Do not reserve 1 KB in every custom app.
+    std::vector<uint8_t> jpegDataBuffer;
     unsigned int jpegDataSize = 0;
 };
 

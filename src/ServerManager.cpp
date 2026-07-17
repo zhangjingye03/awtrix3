@@ -64,6 +64,8 @@ static void sendJsonString(WebServerClass *webserver, const String &json)
 
 void setupWebOtaHandler()
 {
+    server.on("/api/webota", HTTP_GET, []()
+              { server.send(200, F("application/json"), F("{\"status\":\"ready\"}")); });
     server.on(
         "/api/webota", HTTP_POST,
         []()
@@ -267,12 +269,18 @@ void addHandler()
     mws.addHandler("/api/settings", HTTP_GET, []()
                    { String json = DisplayManager.getSettings(); sendJsonString(mws.webserver, json); });
     mws.addHandler("/api/custom", HTTP_POST, []()
-                   { 
-                    if (DisplayManager.parseCustomPage(mws.webserver->arg("name"),mws.webserver->arg("plain").c_str(),false)){
-                        mws.webserver->send(200,F("text/plain"),F("OK")); 
+                   {
+                    DisplayManager.logC3Heap("http_custom_entry");
+                    String name = mws.webserver->arg("name");
+                    String payload = mws.webserver->arg("plain");
+                    DisplayManager.logC3Heap("http_custom_copied");
+                    if (DisplayManager.parseCustomPage(name, payload.c_str(), false)){
+                        DisplayManager.logC3Heap("http_custom_parsed");
+                        mws.webserver->send(200,F("text/plain"),F("OK"));
                     }else{
-                        mws.webserver->send(500,F("text/plain"),F("ErrorParsingJson")); 
-                    } });
+                        mws.webserver->send(500,F("text/plain"),F("ErrorParsingJson"));
+                    }
+                    DisplayManager.logC3Heap("http_custom_complete"); });
     mws.addHandler("/api/stats", HTTP_GET, []()
                    {
                     char statsBuffer[512];

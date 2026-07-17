@@ -22,6 +22,9 @@
 #include <HTTPClient.h>
 #include "base64.hpp"
 #include "Games/GameManager.h"
+#ifdef ESP32_C3
+#include <esp_heap_caps.h>
+#endif
 
 unsigned long lastArtnetStatusTime = 0;
 const int numberOfChannels = 256 * 3;
@@ -67,6 +70,49 @@ DisplayManager_ &DisplayManager_::getInstance()
 }
 
 DisplayManager_ &DisplayManager = DisplayManager.getInstance();
+
+void DisplayManager_::logC3Heap(const char *stage)
+{
+#ifdef ESP32_C3
+  // Fixed slots keep heap diagnostics from allocating while measuring a low-memory path.
+  struct HeapLogSlot
+  {
+    const char *stage;
+    unsigned long lastLog;
+  };
+  static HeapLogSlot slots[48] = {};
+  const unsigned long now = millis();
+  HeapLogSlot *slot = nullptr;
+
+  for (HeapLogSlot &candidate : slots)
+  {
+    if (candidate.stage == stage)
+    {
+      slot = &candidate;
+      break;
+    }
+    if (slot == nullptr && candidate.stage == nullptr)
+      slot = &candidate;
+  }
+
+  if (slot != nullptr)
+  {
+    if (slot->stage == nullptr)
+      slot->stage = stage;
+    if (now - slot->lastLog < 1000)
+      return;
+    slot->lastLog = now;
+  }
+
+  DEBUG_PRINTF("[C3HEAP] %s free=%u largest=%u min=%u",
+               stage,
+               ESP.getFreeHeap(),
+               heap_caps_get_largest_free_block(MALLOC_CAP_8BIT),
+               ESP.getMinFreeHeap());
+#else
+  (void)stage;
+#endif
+}
 
 void DisplayManager_::setBrightness(int bri)
 {
@@ -293,6 +339,7 @@ void DisplayManager_::GradientText(int16_t x, int16_t y, const char *text, int c
 
 void pushCustomApp(String name, int position)
 {
+  DisplayManager.logC3Heap("custom_vector_before");
   if (customApps.count(name) == 0)
   {
     int availableCallbackIndex = -1;
@@ -337,7 +384,10 @@ void pushCustomApp(String name, int position)
       Apps.push_back(std::make_pair(name, customAppCallbacks[availableCallbackIndex]));
     }
 
+    DisplayManager.logC3Heap("custom_vector_after");
+    DisplayManager.logC3Heap("custom_ui_before");
     ui->setApps(Apps); // Add Apps
+    DisplayManager.logC3Heap("custom_ui_after");
     DisplayManager.getInstance().setAutoTransition(true);
   }
 }
@@ -372,7 +422,9 @@ bool deleteCustomAppFile(const String &name)
 
 void removeCustomAppFromApps(const String &name, bool setApps)
 {
+  DisplayManager.logC3Heap("custom_remove_entry");
   // Remove apps from Apps list
+  DisplayManager.logC3Heap("custom_erase_apps_before");
   auto it = Apps.begin();
   while (it != Apps.end())
   {
@@ -385,8 +437,10 @@ void removeCustomAppFromApps(const String &name, bool setApps)
       ++it;
     }
   }
+  DisplayManager.logC3Heap("custom_erase_apps_after");
 
   // Remove apps from customApps map
+  DisplayManager.logC3Heap("custom_erase_map_before");
   auto mapIt = customApps.begin();
   while (mapIt != customApps.end())
   {
@@ -399,12 +453,18 @@ void removeCustomAppFromApps(const String &name, bool setApps)
       ++mapIt;
     }
   }
+  DisplayManager.logC3Heap("custom_erase_map_after");
 
   if (setApps)
+  {
+    DisplayManager.logC3Heap("custom_remove_ui_before");
     ui->setApps(Apps);
+    DisplayManager.logC3Heap("custom_remove_ui_after");
+  }
   DisplayManager.getInstance().setAutoTransition(true);
   deleteCustomAppFile(name);
   DisplayManager.setAppTime(TIME_PER_APP);
+  DisplayManager.logC3Heap("custom_remove_complete");
 }
 
 bool parseFragmentsText(const JsonArray &fragmentArray, std::vector<uint32_t> &colors, std::vector<String> &fragments, uint32_t standardColor)
@@ -434,17 +494,28 @@ bool parseFragmentsText(const JsonArray &fragmentArray, std::vector<uint32_t> &c
 
 bool DisplayManager_::parseCustomPage(const String &name, const char *json, bool preventSave)
 {
+  logC3Heap("custom_outer_entry");
   if ((strcmp(json, "") == 0) || (strcmp(json, "{}") == 0))
   {
     removeCustomAppFromApps(name, true);
     return true;
   }
 
+#ifdef ESP32_C3
+  // Keep custom-page parsing independent of the fragmented C3 heap. Encoded
+  // draw strings only need root-object storage; nested draw arrays still fit
+  // for normal AWTRIX pages while this stays below the former 4 KB reserve.
+  static StaticJsonDocument<2048> doc;
+  doc.clear();
+#else
   DynamicJsonDocument doc(8192);
+#endif
   DeserializationError error = deserializeJson(doc, json);
+  logC3Heap("custom_outer_parsed");
   if (error)
   {
-    DEBUG_PRINTLN(error.c_str());
+    DEBUG_PRINTF("Custom app '%s' rejected: %s (payload=%u bytes, JSON capacity=%u)",
+                 name.c_str(), error.c_str(), strlen(json), doc.capacity());
     doc.clear();
     return false;
   }
@@ -458,15 +529,19 @@ bool DisplayManager_::parseCustomPage(const String &name, const char *json, bool
   {
     JsonArray customPagesArray = doc.as<JsonArray>();
     int cpIndex = 0;
+    bool accepted = true;
     for (JsonObject customPageObject : customPagesArray)
     {
-      generateCustomPage(name + String(cpIndex), customPageObject, preventSave);
+      accepted = generateCustomPage(name + String(cpIndex), customPageObject, preventSave) && accepted;
       ++cpIndex;
     }
+    doc.clear();
+    return accepted;
   }
 
+  DEBUG_PRINTF("Custom app '%s' rejected: root must be an object or array", name.c_str());
   doc.clear();
-  return true;
+  return false;
 }
 
 // Function to subscribe to MQTT topics based on placeholders in text
@@ -491,6 +566,7 @@ void subscribeToPlaceholders(String text)
 
 bool DisplayManager_::generateCustomPage(const String &name, JsonObject doc, bool preventSave)
 {
+  logC3Heap("custom_generate_entry");
   CustomApp customApp;
 
   if (customApps.find(name) != customApps.end())
@@ -618,11 +694,33 @@ bool DisplayManager_::generateCustomPage(const String &name, JsonObject doc, boo
 
   if (doc.containsKey("draw"))
   {
-    customApp.drawInstructions = doc["draw"].as<String>();
+    JsonVariant draw = doc["draw"];
+    if (draw.is<JsonArray>())
+    {
+      // ArduinoJson serializes the upstream array API into the renderer's string format.
+      customApp.drawInstructions = "";
+      logC3Heap("draw_serialize_before");
+      serializeJson(draw, customApp.drawInstructions);
+      logC3Heap("draw_serialize_after");
+    }
+    else if (draw.is<const char *>())
+    {
+      // Keep accepting the encoded-string form used by existing C3 deployments.
+      logC3Heap("draw_string_before");
+      customApp.drawInstructions = draw.as<String>();
+      logC3Heap("draw_string_after");
+    }
+    else
+    {
+      DEBUG_PRINTF("Custom app '%s' rejected: draw must be an array or JSON string", name.c_str());
+      return false;
+    }
   }
   else
   {
+    logC3Heap("draw_clear_before");
     customApp.drawInstructions = "";
+    logC3Heap("draw_clear_after");
   }
 
   if (doc.containsKey("effect"))
@@ -659,7 +757,9 @@ bool DisplayManager_::generateCustomPage(const String &name, JsonObject doc, boo
   customApp.blink = doc.containsKey("blinkText") ? doc["blinkText"].as<int>() : 0;
   customApp.center = doc.containsKey("center") ? doc["center"].as<bool>() : true;
   customApp.noScrolling = doc.containsKey("noScroll") ? doc["noScroll"] : false;
+  logC3Heap("name_assign_before");
   customApp.name = name;
+  logC3Heap("name_assign_after");
 
   customApp.overlay = doc.containsKey("overlay") ? getOverlay(doc["overlay"].as<String>()) : NONE;
 
@@ -669,7 +769,14 @@ bool DisplayManager_::generateCustomPage(const String &name, JsonObject doc, boo
 
     if (newIconName.length() > 64)
     {
-      customApp.jpegDataSize = decode_base64((const unsigned char *)newIconName.c_str(), customApp.jpegDataBuffer);
+      const size_t decodedSize = decode_base64_length((unsigned char *)newIconName.c_str());
+      if (decodedSize > 1000)
+      {
+        DEBUG_PRINTF("Custom app '%s' rejected: base64 icon exceeds 1000 bytes", name.c_str());
+        return false;
+      }
+      customApp.jpegDataBuffer.resize(decodedSize);
+      customApp.jpegDataSize = decode_base64((const unsigned char *)newIconName.c_str(), customApp.jpegDataBuffer.data());
       customApp.isGif = false;
       customApp.icon.close();
       customApp.iconName = "";
@@ -679,6 +786,8 @@ bool DisplayManager_::generateCustomPage(const String &name, JsonObject doc, boo
     else if (customApp.iconName != newIconName)
     {
       customApp.jpegDataSize = 0;
+      customApp.jpegDataBuffer.clear();
+      customApp.jpegDataBuffer.shrink_to_fit();
       customApp.iconName = newIconName;
       customApp.icon.close();
       customApp.iconPosition = 0;
@@ -688,6 +797,8 @@ bool DisplayManager_::generateCustomPage(const String &name, JsonObject doc, boo
   else
   {
     customApp.jpegDataSize = 0;
+    customApp.jpegDataBuffer.clear();
+    customApp.jpegDataBuffer.shrink_to_fit();
     customApp.icon.close();
     customApp.iconName = "";
     customApp.iconPosition = 0;
@@ -734,11 +845,15 @@ bool DisplayManager_::generateCustomPage(const String &name, JsonObject doc, boo
   {
     String text = doc["text"].as<String>();
     subscribeToPlaceholders(utf8ascii(text));
+    logC3Heap("text_assign_before");
     customApp.text = utf8ascii(text);
+    logC3Heap("text_assign_after");
   }
   else
   {
+    logC3Heap("text_clear_before");
     customApp.text = "";
+    logC3Heap("text_clear_after");
   }
 
   if (currentCustomApp != name)
@@ -755,8 +870,12 @@ bool DisplayManager_::generateCustomPage(const String &name, JsonObject doc, boo
   customApp.lastUpdate = millis();
   customApp.lifeTimeEnd = false;
   doc.clear();
+  logC3Heap("custom_insert_before");
   pushCustomApp(name, pos - 1);
+  logC3Heap("custom_map_assign_before");
   customApps[name] = customApp;
+  logC3Heap("custom_map_assign_after");
+  logC3Heap("custom_insert_after");
 
   return true;
 }
@@ -1662,6 +1781,11 @@ size_t DisplayManager_::getStats(char *buffer, size_t bufferSize)
   doc[F("ld2402_motion")] = LD2402_MOVING_STATE > 0 ? "moving" : (LD2402_MOVING_STATE == 0 ? "still" : "unknown");
   doc[F("ld2402_distance")] = LD2402_DISTANCE_CM;
   doc[RamKey] = ESP.getFreeHeap() + ESP.getFreePsram();
+#ifdef ESP32_C3
+  doc[F("ram_min")] = ESP.getMinFreeHeap();
+  doc[F("ram_max_alloc")] = ESP.getMaxAllocHeap();
+  doc[F("reset_reason")] = static_cast<int>(esp_reset_reason());
+#endif
   doc[BrightnessKey] = BRIGHTNESS;
   snprintf(valueBuffer, sizeof(valueBuffer), "%.2f", LDR_FACTOR);
   doc[F("brightness_slope")] = serialized(valueBuffer);
@@ -1708,6 +1832,11 @@ String DisplayManager_::getStats()
   doc[F("ld2402_motion")] = LD2402_MOVING_STATE > 0 ? "moving" : (LD2402_MOVING_STATE == 0 ? "still" : "unknown");
   doc[F("ld2402_distance")] = LD2402_DISTANCE_CM;
   doc[RamKey] = ESP.getFreeHeap() + ESP.getFreePsram();
+#ifdef ESP32_C3
+  doc[F("ram_min")] = ESP.getMinFreeHeap();
+  doc[F("ram_max_alloc")] = ESP.getMaxAllocHeap();
+  doc[F("reset_reason")] = static_cast<int>(esp_reset_reason());
+#endif
   doc[BrightnessKey] = BRIGHTNESS;
   snprintf(valueBuffer, sizeof(valueBuffer), "%.2f", LDR_FACTOR);
   doc[F("brightness_slope")] = serialized(valueBuffer);
@@ -2052,7 +2181,11 @@ void DisplayManager_::gammaCorrection()
 
 void DisplayManager_::sendAppLoop()
 {
-  MQTTManager.publish("stats/loop", getAppsAsJson().c_str());
+  logC3Heap("app_loop_before_json");
+  String appLoop = getAppsAsJson();
+  logC3Heap("app_loop_after_json");
+  MQTTManager.publish("stats/loop", appLoop.c_str());
+  logC3Heap("app_loop_after_publish");
 }
 
 String CRGBtoHex(CRGB color)
@@ -2409,18 +2542,38 @@ void DisplayManager_::reorderApps(const String &jsonString)
 
 void DisplayManager_::processDrawInstructions(int16_t xOffset, int16_t yOffset, String &drawInstructions)
 {
+  logC3Heap("draw_parse_before");
+#ifdef ESP32_C3
+  // Draw instructions are parsed every frame. Reusing a bounded document avoids
+  // an 8 KB heap allocation and serial-log storm that can starve Wi-Fi on C3.
+  static StaticJsonDocument<4096> doc;
+  doc.clear();
+#else
   DynamicJsonDocument doc(8192);
+#endif
   DeserializationError error = deserializeJson(doc, drawInstructions);
+  logC3Heap("draw_parse_after");
 
   if (error)
   {
-    Serial.println("Error parsing JSON draw instructions");
+    static unsigned long lastDrawErrorLog = 0;
+    if (millis() - lastDrawErrorLog >= 5000)
+    {
+      lastDrawErrorLog = millis();
+      DEBUG_PRINTF("Draw instructions rejected: %s (length=%u, capacity=%u)",
+                   error.c_str(), drawInstructions.length(), doc.capacity());
+    }
     return;
   }
 
   if (!doc.is<JsonArray>())
   {
-    Serial.println("Invalid JSON draw instructions format");
+    static unsigned long lastDrawFormatLog = 0;
+    if (millis() - lastDrawFormatLog >= 5000)
+    {
+      lastDrawFormatLog = millis();
+      DEBUG_PRINTLN(F("Draw instructions rejected: root must be an array"));
+    }
     return;
   }
 
@@ -2429,11 +2582,14 @@ void DisplayManager_::processDrawInstructions(int16_t xOffset, int16_t yOffset, 
   {
     for (auto kvp : instruction)
     {
+      logC3Heap("draw_command_before");
       String command = kvp.key().c_str();
+      logC3Heap("draw_command_after");
 
       JsonArray params = kvp.value().as<JsonArray>();
       if (command == "dp")
       {
+        logC3Heap("draw_dp");
         int x = params[0].as<int>();
         int y = params[1].as<int>();
         auto color1 = params[2];
@@ -2442,6 +2598,7 @@ void DisplayManager_::processDrawInstructions(int16_t xOffset, int16_t yOffset, 
       }
       else if (command == "dl")
       {
+        logC3Heap("draw_dl");
         int x0 = params[0].as<int>();
         int y0 = params[1].as<int>();
         int x1 = params[2].as<int>();
@@ -2490,14 +2647,18 @@ void DisplayManager_::processDrawInstructions(int16_t xOffset, int16_t yOffset, 
       }
       else if (command == "dt")
       {
+        logC3Heap("draw_dt_before");
         int x = params[0].as<int>();
         int y = params[1].as<int>();
+        logC3Heap("draw_dt_string_before");
         String text = params[2].as<String>();
+        logC3Heap("draw_dt_string_after");
         auto color7 = params[3];
         uint32_t color = getColorFromJsonVariant(color7, TEXTCOLOR_888);
         setTextColor(color);
         setCursor(x + xOffset, y + yOffset + 5);
         matrixPrint(utf8ascii(text).c_str());
+        logC3Heap("draw_dt_after");
       }
       else if (command == "db")
       {
@@ -2525,6 +2686,7 @@ void DisplayManager_::processDrawInstructions(int16_t xOffset, int16_t yOffset, 
     }
   }
   doc.clear();
+  logC3Heap("draw_parse_complete");
 }
 
 bool DisplayManager_::moodlight(const char *json)

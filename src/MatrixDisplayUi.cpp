@@ -101,15 +101,20 @@ void MatrixDisplayUi::setAppAnimation(AnimationDirection dir)
 
 void MatrixDisplayUi::setApps(const std::vector<std::pair<String, AppCallback>> &appPairs)
 {
+  DisplayManager.logC3Heap("ui_setapps_entry");
   delete[] AppFunctions;
+  DisplayManager.logC3Heap("ui_setapps_deleted");
   AppCount = appPairs.size();
   AppFunctions = new AppCallback[AppCount];
+  DisplayManager.logC3Heap("ui_setapps_allocated");
   for (size_t i = 0; i < AppCount; ++i)
   {
     AppFunctions[i] = appPairs[i].second;
   }
   this->resetState();
+  DisplayManager.logC3Heap("ui_setapps_before_loop");
   DisplayManager.sendAppLoop();
+  DisplayManager.logC3Heap("ui_setapps_after_loop");
   DisplayManager.setAutoTransition(true);
 }
 
