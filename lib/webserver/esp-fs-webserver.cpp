@@ -174,7 +174,10 @@ bool FSWebServer::begin( int port,const char *path)
 
     webserver->enableCORS(true);
 
-    webserver->setContentLength(1024);
+    // Each route supplies its own response size. A global 1024-byte length
+    // makes short endpoints such as /api/stats advertise bytes they never
+    // send, causing HTTP clients to wait until their socket timeout.
+    webserver->setContentLength(CONTENT_LENGTH_NOT_SET);
     webserver->begin(port);
 
     return true;
