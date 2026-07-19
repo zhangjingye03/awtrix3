@@ -174,9 +174,45 @@ private:
         }
     }
 };
-// The normal framework lifecycle handles queued clients correctly now that
-// GIF files use a bounded VFS buffer on the ESP32-C3.
-WebServer server(80);
+
+// Keep the framework request lifecycle, but do not drop a partial TCP write.
+// NetworkClient can return zero while the C3's small send queue is draining.
+class C3StreamingWebServer : public WebServer
+{
+public:
+    using WebServer::WebServer;
+
+protected:
+    size_t _currentClientWrite(const char *buffer, size_t length) override
+    {
+        return writeAll(reinterpret_cast<const uint8_t *>(buffer), length);
+    }
+
+    size_t _currentClientWrite_P(PGM_P buffer, size_t length) override
+    {
+        // ESP32 flash is memory mapped, so this remains a zero-copy stream.
+        return writeAll(reinterpret_cast<const uint8_t *>(buffer), length);
+    }
+
+private:
+    size_t writeAll(const uint8_t *buffer, size_t length)
+    {
+        size_t written = 0;
+        const uint32_t timeoutAt = millis() + 3000;
+
+        while (written < length && _currentClient.connected() && millis() < timeoutAt)
+        {
+            const size_t count = _currentClient.write(buffer + written, min(length - written, static_cast<size_t>(512)));
+            if (count)
+                written += count;
+            else
+                delay(1);
+        }
+        return written;
+    }
+};
+
+C3StreamingWebServer server(80);
 #else
 WebServer server(80);
 #endif
@@ -188,7 +224,16 @@ WiFiServer TCPserver(8080);
 static bool webOtaSucceeded = false;
 static bool webOtaStarted = false;
 static size_t webOtaBytesWritten = 0;
+static size_t webOtaExpectedSize = 0;
 static String webOtaError;
+
+static void failWebOta(const String &error)
+{
+    if (!webOtaError.length())
+        webOtaError = error;
+    if (Update.isRunning())
+        Update.abort();
+}
 
 #ifdef ESP32_C3
 static String c3IconUploadName;
@@ -320,7 +365,13 @@ static bool finalizeWebOta()
     if (webOtaSucceeded || webOtaError.length() || !webOtaStarted || !webOtaBytesWritten)
         return webOtaSucceeded;
 
-    if (Update.end(true))
+    if (webOtaBytesWritten != webOtaExpectedSize)
+    {
+        failWebOta(F("incomplete upload"));
+        return false;
+    }
+
+    if (Update.end())
     {
         webOtaSucceeded = true;
         DEBUG_PRINTF("Web OTA success: %u bytes", webOtaBytesWritten);
@@ -329,7 +380,7 @@ static bool finalizeWebOta()
 
     StreamString error;
     Update.printError(error);
-    webOtaError = error.c_str();
+    failWebOta(error.c_str());
     return false;
 }
 
@@ -402,7 +453,11 @@ static void handleC3MqttConfig()
 void setupWebOtaHandler()
 {
     server.on("/api/webota", HTTP_GET, []()
-              { server.send(200, F("application/json"), F("{\"status\":\"ready\"}")); });
+              {
+                  char status[80];
+                  snprintf(status, sizeof(status), "{\"status\":\"ready\",\"protocol\":1,\"uptime\":%lu}", millis() / 1000UL);
+                  server.send(200, F("application/json"), status);
+              });
     server.on(
         "/api/webota", HTTP_POST,
         []()
@@ -435,6 +490,7 @@ void setupWebOtaHandler()
                 webOtaSucceeded = false;
                 webOtaStarted = true;
                 webOtaBytesWritten = 0;
+                webOtaExpectedSize = 0;
                 webOtaError = "";
                 DEBUG_PRINTF("Web OTA start: %s", upload.filename.c_str());
                 DisplayManager.clear();
@@ -442,11 +498,22 @@ void setupWebOtaHandler()
                 DisplayManager.printText(0, 6, "OTA", true, true);
                 DisplayManager.show();
 
-                if (!Update.begin(UPDATE_SIZE_UNKNOWN, U_FLASH))
+                const String sizeHeader = server.arg("size");
+                const String md5Header = server.arg("md5");
+                char *end = nullptr;
+                const unsigned long expectedSize = strtoul(sizeHeader.c_str(), &end, 10);
+                if (!sizeHeader.length() || end == sizeHeader.c_str() || *end != '\0' || expectedSize == 0 || md5Header.length() != 32)
+                {
+                    failWebOta(F("missing OTA size or MD5"));
+                    return;
+                }
+
+                webOtaExpectedSize = expectedSize;
+                if (!Update.begin(webOtaExpectedSize, U_FLASH) || !Update.setMD5(md5Header.c_str()))
                 {
                     StreamString error;
                     Update.printError(error);
-                    webOtaError = error.c_str();
+                    failWebOta(error.c_str());
                     DEBUG_PRINTF("Web OTA begin failed: %s", webOtaError.c_str());
                 }
             }
@@ -460,7 +527,7 @@ void setupWebOtaHandler()
                 {
                     StreamString error;
                     Update.printError(error);
-                    webOtaError = error.c_str();
+                    failWebOta(error.c_str());
                     DEBUG_PRINTF("Web OTA write failed: %s", webOtaError.c_str());
                 }
             }
@@ -470,7 +537,8 @@ void setupWebOtaHandler()
             }
             else if (upload.status == UPLOAD_FILE_ABORTED)
             {
-                Update.end();
+                if (Update.isRunning())
+                    Update.abort();
                 webOtaStarted = false;
                 webOtaError = F("aborted");
                 DEBUG_PRINTLN(F("Web OTA aborted"));

@@ -53,8 +53,8 @@ Current ESP32-C3 specific support includes:
 Recommended PlatformIO environments:
 - `esp32-c3-fastled`: main ESP32-C3 firmware build using Arduino-ESP32 3.x / IDF 5
 - `esp32-c3-fastled-core2017`: Arduino-ESP32 2.0.17 recovery build
-- `esp32-c3-fastled-ota`: ESP OTA upload target
-- `esp32-c3-fastled-webota`: HTTP OTA upload target
+- `esp32-c3-fastled-ota`: verified HTTP OTA upload target
+- `esp32-c3-fastled-webota`: compatibility alias for the verified HTTP OTA target
 
 Notes:
 - FastLED `3.10.x` is used for ESP32-C3 matrix compatibility and reduced WS2812 flicker.
@@ -64,6 +64,7 @@ Notes:
 - Animated GIFs temporarily require roughly a 4 KB contiguous heap block; the heap is released after the active GIF page changes or is removed.
 - WS2812 matrices must use an adequately rated external 5 V supply with a common ground to the ESP32-C3. A brownout reset (`reset_reason: 9`) indicates insufficient matrix power, not a CustomApp parsing failure. Auto brightness can drive substantial LED current at high lux.
 - LD2402 engineering output is used for live presence, motion, and distance parsing.
+- C3 OTA verifies firmware size and MD5 before switching the OTA partition, then waits for the rebooted device to report ready.
 - LD2402 calibration follows the module command flow: start auto-threshold generation, query progress, save parameters, and restore engineering mode.
 - ESP32-C3 pin mapping is defined for buttons, I2C, and buzzer; DFPlayer MP3 modules are not supported on ESP32-C3.
 - AHTX0 temperature/humidity sensors are auto-detected.

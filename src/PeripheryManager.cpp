@@ -106,6 +106,29 @@ Adafruit_AHTX0 ahtx0;
 Adafruit_Sensor *ahtx0_humidity, *ahtx0_temp;
 BH1750 bh1750;
 bool bh1750Detected = false;
+uint8_t bh1750ReadFailures = 0;
+unsigned long lastBH1750ReadAt = 0;
+unsigned long lastBH1750RetryAt = 0;
+float bh1750FilteredLux = 0.0f;
+bool bh1750LuxInitialized = false;
+static const unsigned long BH1750_READ_INTERVAL_MS = 200;
+static const unsigned long BH1750_RETRY_INTERVAL_MS = 30000;
+
+static bool initializeBH1750()
+{
+    const bool detected = bh1750.begin(BH1750::CONTINUOUS_HIGH_RES_MODE, 0x23, &Wire) ||
+                          bh1750.begin(BH1750::CONTINUOUS_HIGH_RES_MODE, 0x5C, &Wire);
+    bh1750Detected = detected;
+    BH1750_AVAILABLE = detected;
+    bh1750ReadFailures = 0;
+    bh1750LuxInitialized = false;
+    lastBH1750RetryAt = millis();
+
+    if (detected && DEBUG_MODE)
+        DEBUG_PRINTLN(F("BH1750 light sensor detected"));
+
+    return detected;
+}
 
 #if defined(ESP32_C3) && LD2402_ENABLED
 HardwareSerial ld2402Serial(1);
@@ -123,6 +146,7 @@ bool ld2402CalibrationSavePending = false;
 const char *ld2402CalibrationState = "idle";
 static const unsigned long LD2402_CALIBRATION_QUERY_INTERVAL_MS = 1000;
 static const unsigned long LD2402_CALIBRATION_TIMEOUT_MS = 45000;
+static const unsigned long LD2402_FRAME_TIMEOUT_MS = 5000;
 #endif
 
 #ifdef awtrix2_upgrade
@@ -177,6 +201,7 @@ static bool hasValidTempHum = false;
 static float lastValidTemp = 0;
 static float lastValidHum = 0;
 static unsigned long lastInvalidTempHumLog = 0;
+static const float TEMP_HUM_FILTER_ALPHA = 0.15f;
 int total = 0;
 unsigned long startTime;
 
@@ -212,7 +237,10 @@ static void setLD2402State(bool presence, uint16_t distanceCm, int8_t movingStat
     LD2402_AVAILABLE = true;
     LD2402_PRESENCE = presence;
     LD2402_MOVING_STATE = movingState;
-    LD2402_DISTANCE_CM = distanceCm;
+    // The module reports zero when no target is present. Presence already
+    // carries that state, so keep the last measured range for MQTT/HA.
+    if (distanceCm > 0)
+        LD2402_DISTANCE_CM = distanceCm;
     ld2402ValidFrames++;
     ld2402LastFrameAt = millis();
 
@@ -222,7 +250,7 @@ static void setLD2402State(bool presence, uint16_t distanceCm, int8_t movingStat
     if (DEBUG_MODE && (!ld2402ReportedOnce || millis() - lastLD2402Log >= 5000))
     {
         const char *motionText = movingState > 0 ? "moving" : (movingState == 0 ? "still" : "unknown");
-        DEBUG_PRINTF("LD2402 presence=%s moving=%s distance=%u cm", presence ? "true" : "false", motionText, distanceCm);
+        DEBUG_PRINTF("LD2402 presence=%s moving=%s distance=%u cm", presence ? "true" : "false", motionText, LD2402_DISTANCE_CM);
         ld2402ReportedOnce = true;
         lastLD2402Log = millis();
     }
@@ -589,6 +617,22 @@ static void updateLD2402Calibration()
         sendLD2402Command(progressQuery, sizeof(progressQuery));
     }
 }
+
+static void updateLD2402Availability()
+{
+    if (!LD2402_AVAILABLE || ld2402CalibrationActive || millis() - ld2402LastFrameAt < LD2402_FRAME_TIMEOUT_MS)
+        return;
+
+    // Retain LD2402_DISTANCE_CM as the last known range, but do not present
+    // stale occupancy data when UART frames have stopped arriving.
+    LD2402_AVAILABLE = false;
+    LD2402_PRESENCE = false;
+    LD2402_MOVING_STATE = -1;
+    MQTTManager.publishLD2402State();
+
+    if (DEBUG_MODE)
+        DEBUG_PRINTLN(F("LD2402 UART frame timeout"));
+}
 #endif
 
 static void printSensorStatus()
@@ -618,7 +662,11 @@ static uint8_t calculateAutoBrightness()
     {
         const float scaledLux = max(0.0f, CURRENT_LUX * LDR_FACTOR);
         const float clampedLux = min(scaledLux, 1000.0f);
-        brightnessPercent = (log10f(clampedLux + 1.0f) / log10f(1001.0f)) * 100.0f;
+        // Keep the low-light portion continuous; the previous integer percent
+        // conversion made one-lux changes jump or get discarded entirely.
+        const float normalizedLux = log1pf(clampedLux) / log1pf(1000.0f);
+        const float brightness = MIN_BRIGHTNESS + normalizedLux * (MAX_BRIGHTNESS - MIN_BRIGHTNESS);
+        return constrain(static_cast<int>(lroundf(brightness)), static_cast<int>(MIN_BRIGHTNESS), static_cast<int>(MAX_BRIGHTNESS));
     }
     else
     {
@@ -921,7 +969,12 @@ void PeripheryManager_::setup()
     if (HAS_RESET_BUTTON)
         button_reset.begin();
 
-    if ((ROTATE_SCREEN && !SWAP_BUTTONS) || (!ROTATE_SCREEN && SWAP_BUTTONS))
+    bool swapButtonCallbacks = (ROTATE_SCREEN && !SWAP_BUTTONS) || (!ROTATE_SCREEN && SWAP_BUTTONS);
+#ifdef ESP32_C3
+    // Match the requested physical navigation direction on the C3 board.
+    swapButtonCallbacks = !swapButtonCallbacks;
+#endif
+    if (swapButtonCallbacks)
     {
         Serial.println("Button rotation");
         button_left.onPressed(right_button_pressed);
@@ -974,14 +1027,7 @@ void PeripheryManager_::setup()
         TEMP_SENSOR_TYPE = TEMP_SENSOR_TYPE_AHTX0;
     }
 
-    if (bh1750.begin(BH1750::CONTINUOUS_HIGH_RES_MODE, 0x23, &Wire) ||
-        bh1750.begin(BH1750::CONTINUOUS_HIGH_RES_MODE, 0x5C, &Wire))
-    {
-        bh1750Detected = true;
-        BH1750_AVAILABLE = true;
-        if (DEBUG_MODE)
-            DEBUG_PRINTLN(F("BH1750 light sensor detected"));
-    }
+    initializeBH1750();
 
 #if defined(ESP32_C3) && LD2402_ENABLED
     ld2402Serial.begin(LD2402_BAUD, SERIAL_8N1, LD2402_RX_PIN, LD2402_TX_PIN);
@@ -1006,6 +1052,7 @@ void PeripheryManager_::tick()
 #if defined(ESP32_C3) && LD2402_ENABLED
     pollLD2402();
     updateLD2402Calibration();
+    updateLD2402Availability();
 #endif
 
     if (!MenuManager.inMenu)
@@ -1108,9 +1155,21 @@ void PeripheryManager_::tick()
 
             if (inRange && !suddenJump)
             {
-                lastValidTemp = CURRENT_TEMP;
-                lastValidHum = CURRENT_HUM;
+                if (hasValidTempHum)
+                {
+                    // AHT/SHT humidity naturally has a few-percent short
+                    // term variation. Smooth it before MQTT/HA sees a jump.
+                    lastValidTemp += (CURRENT_TEMP - lastValidTemp) * TEMP_HUM_FILTER_ALPHA;
+                    lastValidHum += (CURRENT_HUM - lastValidHum) * TEMP_HUM_FILTER_ALPHA;
+                }
+                else
+                {
+                    lastValidTemp = CURRENT_TEMP;
+                    lastValidHum = CURRENT_HUM;
+                }
                 hasValidTempHum = true;
+                CURRENT_TEMP = lastValidTemp;
+                CURRENT_HUM = lastValidHum;
             }
             else if (hasValidTempHum)
             {
@@ -1141,11 +1200,43 @@ void PeripheryManager_::tick()
         LDR_RAW = meanFilterLDR.AddValue(medianFilterLDR.AddValue(LDRVALUE));
         if (bh1750Detected)
         {
-            const float lux = bh1750.readLightLevel();
-            if (lux >= 0)
-                CURRENT_LUX = (roundf(lux * 1000) / 1000);
+            if (currentMillis_LDR - lastBH1750ReadAt >= BH1750_READ_INTERVAL_MS)
+            {
+                lastBH1750ReadAt = currentMillis_LDR;
+                const float lux = bh1750.readLightLevel();
+                if (lux >= 0)
+                {
+                    if (!bh1750LuxInitialized)
+                    {
+                        bh1750FilteredLux = lux;
+                        bh1750LuxInitialized = true;
+                    }
+                    else
+                    {
+                        // Smooth small BH1750 fluctuations without making
+                        // a real lighting change feel sluggish.
+                        bh1750FilteredLux += (lux - bh1750FilteredLux) * 0.2f;
+                    }
+                    CURRENT_LUX = (roundf(bh1750FilteredLux * 1000) / 1000);
+                    bh1750ReadFailures = 0;
+                }
+                else if (++bh1750ReadFailures >= 3)
+                {
+                    // Fall back to the LDR until a later I2C probe succeeds.
+                    bh1750Detected = false;
+                    BH1750_AVAILABLE = false;
+                    lastBH1750RetryAt = currentMillis_LDR;
+                    if (DEBUG_MODE)
+                        DEBUG_PRINTLN(F("BH1750 read failed; falling back to LDR"));
+                }
+            }
         }
-        else
+        else if (currentMillis_LDR - lastBH1750RetryAt >= BH1750_RETRY_INTERVAL_MS)
+        {
+            initializeBH1750();
+        }
+
+        if (!bh1750Detected)
         {
             CURRENT_LUX = (roundf(photocell.getSmoothedLux() * 1000) / 1000);
         }
@@ -1159,7 +1250,8 @@ void PeripheryManager_::tick()
             static unsigned long lastC3BrightnessUpdate = 0;
             canUpdateBrightness = currentMillis_LDR - lastC3BrightnessUpdate >= 500;
 #endif
-            if (canUpdateBrightness && abs(static_cast<int>(autoBrightness) - BRIGHTNESS) >= 2)
+            const int minimumBrightnessChange = bh1750Detected ? 1 : 2;
+            if (canUpdateBrightness && abs(static_cast<int>(autoBrightness) - BRIGHTNESS) >= minimumBrightnessChange)
             {
                 BRIGHTNESS = autoBrightness;
                 DisplayManager.setBrightness(BRIGHTNESS);

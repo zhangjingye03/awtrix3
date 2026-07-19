@@ -1,4 +1,6 @@
 import http.client
+import hashlib
+import json
 import os
 import time
 from urllib.parse import urlparse
@@ -31,14 +33,17 @@ def _post_firmware(host, port, path, firmware_path):
     boundary = "----awtrix-webota-boundary"
     filename = os.path.basename(firmware_path)
     with open(firmware_path, "rb") as firmware:
+        firmware_data = firmware.read()
         body = (
             f"--{boundary}\r\n"
             f'Content-Disposition: form-data; name="firmware"; filename="{filename}"\r\n'
             "Content-Type: application/octet-stream\r\n\r\n"
         ).encode("ascii")
-        body += firmware.read()
+        body += firmware_data
         body += f"\r\n--{boundary}--\r\n".encode("ascii")
 
+    firmware_size = len(firmware_data)
+    firmware_md5 = hashlib.md5(firmware_data).hexdigest()
     headers = {
         "Content-Type": f"multipart/form-data; boundary={boundary}",
         "Content-Length": str(len(body)),
@@ -47,7 +52,7 @@ def _post_firmware(host, port, path, firmware_path):
 
     conn = http.client.HTTPConnection(host, port, timeout=25)
     try:
-        conn.request("POST", path, body=body, headers=headers)
+        conn.request("POST", f"{path}?size={firmware_size}&md5={firmware_md5}", body=body, headers=headers)
         response = conn.getresponse()
         response_body = response.read().decode("utf-8", "replace")
         return response.status, response_body
@@ -60,16 +65,28 @@ def webota_upload(source, target, env):
     host, port, path = _target_from_upload_port(env.subst("$UPLOAD_PORT"))
     print(f"Uploading {firmware_path} to http://{host}:{port}{path}")
 
+    baseline_uptime = None
+    try:
+        status, body = _http_get(host, port, path)
+        ready = json.loads(body)
+        if status != 200 or ready.get("status") != "ready" or ready.get("protocol") != 1:
+            print("Device does not expose the verified HTTP OTA protocol.")
+            return 1
+        baseline_uptime = ready.get("uptime")
+    except Exception as exc:
+        print(f"Cannot contact OTA endpoint: {exc}")
+        return 1
+
     try:
         status, response_body = _post_firmware(host, port, path, firmware_path)
         print(f"HTTP OTA response status: {status}")
         if response_body:
             print(f"HTTP OTA response: {response_body}")
-        if not 200 <= status < 300:
+        if status != 200 or response_body.strip() != "OK":
             return 1
     except Exception as exc:
-        # The ESP often reboots before the HTTP client receives the final page.
-        print(f"HTTP OTA connection ended during reboot: {exc}")
+        print(f"HTTP OTA upload did not complete: {exc}")
+        return 1
 
     poll_path = path
     print("Waiting for device to return...")
@@ -78,9 +95,11 @@ def webota_upload(source, target, env):
         time.sleep(3)
         try:
             status, response_body = _http_get(host, port, poll_path)
-            if status == 200 and '"status":"ready"' in response_body:
-                print("HTTP OTA complete; device is ready.")
-                return 0
+            ready = json.loads(response_body)
+            if status == 200 and ready.get("status") == "ready" and ready.get("protocol") == 1:
+                if baseline_uptime is None or ready.get("uptime", baseline_uptime + 1) <= baseline_uptime:
+                    print("HTTP OTA complete; device rebooted and is ready.")
+                    return 0
         except Exception:
             pass
 

@@ -41,6 +41,10 @@ static const uint32_t MQTT_MIN_MAX_ALLOC_HEAP = 4096;
 static const uint32_t MQTT_C3_CURRENT_APP_MIN_FREE_HEAP = 20000;
 static const uint32_t MQTT_C3_CURRENT_APP_MIN_MAX_ALLOC_HEAP = 6000;
 static const unsigned long MQTT_C3_STATS_INTERVAL = 60000;
+static const unsigned long MQTT_C3_RAM_INTERVAL = 600000;
+static const unsigned long MQTT_C3_WIFI_SIGNAL_INTERVAL = 300000;
+static unsigned long c3LastRamPublish = 0;
+static unsigned long c3LastWifiSignalPublish = 0;
 #endif
 
 #ifdef ESP32_C3
@@ -244,13 +248,13 @@ static void publishC3HaDiscoveryTick(unsigned long now)
         break;
     case 6:
         snprintf(payload, sizeof(payload),
-                 "{\"name\":\"Temperature\",\"unique_id\":\"%s_temperature\",\"state_topic\":\"%s/stats\",\"value_template\":\"{{ value_json.temp }}\",\"device_class\":\"temperature\",\"unit_of_measurement\":\"C\",\"icon\":\"mdi:thermometer\",%s}",
+                 "{\"name\":\"Temperature\",\"unique_id\":\"%s_temperature\",\"state_topic\":\"%s/stats/temp\",\"device_class\":\"temperature\",\"unit_of_measurement\":\"\\u00b0C\",\"suggested_display_precision\":1,\"icon\":\"mdi:thermometer\",%s}",
                  MQTT_PREFIX.c_str(), MQTT_PREFIX.c_str(), deviceJson);
         published = publishC3HaConfig("sensor", "temperature", payload);
         break;
     case 7:
         snprintf(payload, sizeof(payload),
-                 "{\"name\":\"Humidity\",\"unique_id\":\"%s_humidity\",\"state_topic\":\"%s/stats\",\"value_template\":\"{{ value_json.hum }}\",\"device_class\":\"humidity\",\"unit_of_measurement\":\"%%\",\"icon\":\"mdi:water-percent\",%s}",
+                 "{\"name\":\"Humidity\",\"unique_id\":\"%s_humidity\",\"state_topic\":\"%s/stats/humidity\",\"device_class\":\"humidity\",\"unit_of_measurement\":\"%%\",\"icon\":\"mdi:water-percent\",%s}",
                  MQTT_PREFIX.c_str(), MQTT_PREFIX.c_str(), deviceJson);
         published = publishC3HaConfig("sensor", "humidity", payload);
         break;
@@ -268,19 +272,19 @@ static void publishC3HaDiscoveryTick(unsigned long now)
         break;
     case 10:
         snprintf(payload, sizeof(payload),
-                 "{\"name\":\"Free RAM\",\"unique_id\":\"%s_ram\",\"state_topic\":\"%s/stats\",\"value_template\":\"{{ value_json.ram }}\",\"device_class\":\"data_size\",\"unit_of_measurement\":\"B\",\"icon\":\"mdi:memory\",%s}",
+                 "{\"name\":\"Free RAM\",\"unique_id\":\"%s_ram\",\"state_topic\":\"%s/stats/ram\",\"device_class\":\"data_size\",\"unit_of_measurement\":\"B\",\"icon\":\"mdi:memory\",%s}",
                  MQTT_PREFIX.c_str(), MQTT_PREFIX.c_str(), deviceJson);
         published = publishC3HaConfig("sensor", "ram", payload);
         break;
     case 11:
         snprintf(payload, sizeof(payload),
-                 "{\"name\":\"Uptime\",\"unique_id\":\"%s_uptime\",\"state_topic\":\"%s/stats\",\"value_template\":\"{{ value_json.uptime }}\",\"device_class\":\"duration\",\"unit_of_measurement\":\"s\",\"icon\":\"mdi:timer-outline\",%s}",
+                 "{\"name\":\"Uptime\",\"unique_id\":\"%s_uptime\",\"state_topic\":\"%s/stats/uptime\",\"device_class\":\"duration\",\"unit_of_measurement\":\"s\",\"icon\":\"mdi:timer-outline\",%s}",
                  MQTT_PREFIX.c_str(), MQTT_PREFIX.c_str(), deviceJson);
         published = publishC3HaConfig("sensor", "uptime", payload);
         break;
     case 12:
         snprintf(payload, sizeof(payload),
-                 "{\"name\":\"WiFi Signal\",\"unique_id\":\"%s_wifi_signal\",\"state_topic\":\"%s/stats\",\"value_template\":\"{{ value_json.wifi_signal }}\",\"device_class\":\"signal_strength\",\"unit_of_measurement\":\"dB\",\"icon\":\"mdi:wifi\",%s}",
+                 "{\"name\":\"WiFi Signal\",\"unique_id\":\"%s_wifi_signal\",\"state_topic\":\"%s/stats/wifi_signal\",\"device_class\":\"signal_strength\",\"unit_of_measurement\":\"dB\",\"icon\":\"mdi:wifi\",%s}",
                  MQTT_PREFIX.c_str(), MQTT_PREFIX.c_str(), deviceJson);
         published = publishC3HaConfig("sensor", "wifi_signal", payload);
         break;
@@ -334,7 +338,7 @@ static void publishC3HaDiscoveryTick(unsigned long now)
         break;
     case 21:
         snprintf(payload, sizeof(payload),
-                 "{\"name\":\"Brightness Lux Slope\",\"unique_id\":\"%s_brightness_lux_slope\",\"command_topic\":\"%s/brightness/slope\",\"state_topic\":\"%s/stats\",\"value_template\":\"{{ value_json.brightness_slope }}\",\"min\":0.2,\"max\":5,\"step\":0.1,\"mode\":\"slider\",\"icon\":\"mdi:chart-bell-curve\",%s}",
+                 "{\"name\":\"Brightness Lux Slope\",\"unique_id\":\"%s_brightness_lux_slope\",\"command_topic\":\"%s/ha/brightness_slope\",\"state_topic\":\"%s/brightness/slope\",\"min\":0.2,\"max\":5,\"step\":0.1,\"mode\":\"slider\",\"icon\":\"mdi:chart-bell-curve\",%s}",
                  MQTT_PREFIX.c_str(), MQTT_PREFIX.c_str(), MQTT_PREFIX.c_str(), deviceJson);
         published = publishC3HaConfig("number", "brightness_lux_slope", payload);
         break;
@@ -478,16 +482,22 @@ void processMqttMessage(const String &strTopic, const String &payloadCopy)
         return;
     }
 
-    if (strTopic.equals(MQTT_PREFIX + "/brightness/slope"))
+    if (strTopic.equals(MQTT_PREFIX + "/ha/brightness_slope"))
     {
         const float requestedSlope = payloadCopy.toFloat();
         if (requestedSlope >= 0.2f && requestedSlope <= 5.0f)
         {
+            // State and command topics must stay separate. The client receives
+            // its own retained state publishes through the broker.
+            if (fabsf(requestedSlope - LDR_FACTOR) < 0.005f)
+                return;
+
             LDR_FACTOR = requestedSlope;
             persistBrightnessSlope();
             char slopeText[16];
             snprintf(slopeText, sizeof(slopeText), "%.2f", LDR_FACTOR);
-            MQTTManager.publish("brightness/slope", slopeText);
+            mqttPublishRetained((MQTT_PREFIX + "/brightness/slope").c_str(), slopeText);
+            publishC3StatsNow();
             if (DEBUG_MODE)
                 DEBUG_PRINTF("Brightness lux slope set to %.2f", LDR_FACTOR);
         }
@@ -883,7 +893,7 @@ void onMqttConnected()
         "/sendscreen",
         "/r2d2",
         "/ld2402/calibrate",
-        "/brightness/slope",
+        "/ha/brightness_slope",
         "/ha/matrix_power",
         "/ha/indicator1",
         "/ha/indicator2",
@@ -1077,6 +1087,36 @@ void MQTTManager_::sendStats()
     char luxBuffer[16];
     snprintf(luxBuffer, sizeof(luxBuffer), "%.3f", CURRENT_LUX);
     publish("stats/lux", luxBuffer);
+    char temperatureBuffer[16];
+    // Keep the matrix's configurable whole-degree display, but publish one
+    // decimal to Home Assistant so gradual sensor movement remains visible.
+    snprintf(temperatureBuffer, sizeof(temperatureBuffer), "%.1f", CURRENT_TEMP);
+    publish("stats/temp", temperatureBuffer);
+    char humidityBuffer[16];
+    snprintf(humidityBuffer, sizeof(humidityBuffer), "%.0f", CURRENT_HUM);
+    publish("stats/humidity", humidityBuffer);
+    char slopeBuffer[16];
+    snprintf(slopeBuffer, sizeof(slopeBuffer), "%.2f", LDR_FACTOR);
+    mqttPublishRetained((MQTT_PREFIX + "/brightness/slope").c_str(), slopeBuffer);
+#ifdef ESP32_C3
+    char uptimeBuffer[16];
+    snprintf(uptimeBuffer, sizeof(uptimeBuffer), "%lu", PeripheryManager.readUptime());
+    publish("stats/uptime", uptimeBuffer);
+    if (millis() - c3LastRamPublish >= MQTT_C3_RAM_INTERVAL)
+    {
+        c3LastRamPublish = millis();
+        char ramBuffer[16];
+        snprintf(ramBuffer, sizeof(ramBuffer), "%u", ESP.getFreeHeap());
+        publish("stats/ram", ramBuffer);
+    }
+    if (millis() - c3LastWifiSignalPublish >= MQTT_C3_WIFI_SIGNAL_INTERVAL)
+    {
+        c3LastWifiSignalPublish = millis();
+        char wifiSignalBuffer[8];
+        snprintf(wifiSignalBuffer, sizeof(wifiSignalBuffer), "%d", WiFi.RSSI());
+        publish("stats/wifi_signal", wifiSignalBuffer);
+    }
+#endif
     publishLD2402State();
 #ifdef ESP32_C3
       char statsBuffer[512];

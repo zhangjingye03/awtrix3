@@ -20,29 +20,6 @@ static void sendGzipPage(WebServerClass *server, PGM_P content, size_t length)
     }
 }
 
-#ifdef ESP32_C3
-static const char C3_WIFI_SETUP_HTML[] PROGMEM =
-    "<!doctype html><meta name=viewport content='width=device-width,initial-scale=1'>"
-    "<title>AWTRIX C3</title><style>body{font:16px sans-serif;max-width:34rem;margin:2rem auto;padding:0 1rem}"
-    "input,button{box-sizing:border-box;margin:.25rem 0;padding:.55rem;width:100%}h2{margin-top:1.6rem}small{color:#555}</style>"
-    "<h1>AWTRIX C3</h1><h2>Wi-Fi</h2><form method=post action=/connect><input required name=ssid placeholder=SSID>"
-    "<input required name=password type=password placeholder=Password><button>Connect</button></form>"
-    "<p><a href=/scan>Scan</a> | <a href=/status>Status</a> | <a href=/api/stats>Device stats</a> | <a href=/screen>Live view</a></p>"
-    "<h2>MQTT</h2><form id=m><input id=h placeholder='Broker host' required><input id=p type=number placeholder=Port>"
-    "<input id=u placeholder=Username><input id=w type=password placeholder=Password><input id=x placeholder='Topic prefix'>"
-    "<label><input id=d type=checkbox style=width:auto> Home Assistant discovery</label><button>Save MQTT and reboot</button></form>"
-    "<h2>Icon upload</h2><form id=i><input id=n placeholder='Icon name, e.g. test.gif' required><input id=f type=file accept='.gif,.jpg,.jpeg' required>"
-    "<button>Upload to /ICONS</button></form><small id=s></small><p><a href=/restart>Restart device</a></p>"
-    "<script>const q=id=>document.getElementById(id),s=q('s');fetch('/api/c3/mqtt').then(r=>r.json()).then(v=>{h.value=v.host||'';p.value=v.port||1883;u.value=v.user||'';x.value=v.prefix||'';d.checked=!!v.discovery}).catch(()=>{});"
-    "q('m').onsubmit=async e=>{e.preventDefault();let v={host:h.value,port:+p.value||1883,user:u.value,prefix:x.value,discovery:d.checked};if(w.value)v.pass=w.value;let r=await fetch('/api/c3/mqtt',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(v)});s.textContent=r.ok?'Saved. Rebooting...':'Save failed';if(r.ok)setTimeout(()=>fetch('/api/reboot',{method:'POST'}),300)};"
-    "q('i').onsubmit=async e=>{e.preventDefault();let z=q('n').value.replace(/^.*[\\/]/,''),f=q('f').files[0];if(!/^[\\w.-]+\\.(gif|jpe?g)$/i.test(z)){s.textContent='Use a .gif or .jpg filename';return}if(!f||f.size>32768){s.textContent='Icons must be 1-32 KB';return}s.textContent='Uploading...';let b=new Uint8Array(await f.arrayBuffer());try{for(let o=0;o<b.length;o+=384){let v='';for(let k=o;k<Math.min(o+384,b.length);k++)v+=String.fromCharCode(b[k]);let r=await fetch('/api/c3/icon',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({name:z,data:btoa(v),start:o===0,final:o+384>=b.length})});if(!r.ok)throw Error(r.status);s.textContent='Uploading '+Math.min(100,Math.ceil((o+384)*100/b.length))+'%'}s.textContent='Icon uploaded'}catch(x){s.textContent='Upload failed'}};</script>";
-
-static void sendC3WifiSetup(WebServerClass *server)
-{
-    server->send_P(200, PSTR("text/html"), C3_WIFI_SETUP_HTML, sizeof(C3_WIFI_SETUP_HTML) - 1);
-}
-#endif
-
 FSWebServer::FSWebServer(fs::FS &fs, WebServerClass &server)
 {
     m_filesystem = &fs;
@@ -578,11 +555,7 @@ void FSWebServer::removeWhiteSpaces(String &str)
 
 void FSWebServer::handleSetup()
 {
-#ifdef ESP32_C3
-    sendC3WifiSetup(webserver);
-#else
     sendGzipPage(webserver, SETUP_HTML, SETUP_HTML_SIZE);
-#endif
 }
 #endif
 
@@ -599,11 +572,7 @@ void FSWebServer::handleIndex()
 #ifdef INCLUDE_SETUP_HTM
     else
     {
-#ifdef ESP32_C3
-        sendC3WifiSetup(webserver);
-#else
         handleSetup();
-#endif
     }
 #endif
 }
@@ -1059,11 +1028,7 @@ void FSWebServer::handleFileDelete()
 */
 void FSWebServer::handleGetEdit()
 {
-#ifdef ESP32_C3
-    // The embedded editor is too large for the synchronous C3 WebServer and
-    // can block Wi-Fi while its TCP socket is congested.
-    webserver->send(503, "text/plain", "File editor is unavailable on ESP32-C3.");
-#elif defined(INCLUDE_EDIT_HTM)
+#if defined(INCLUDE_EDIT_HTM)
     sendGzipPage(webserver, edit_htm_gz, sizeof(edit_htm_gz));
 #else
     replyToCLient(NOT_FOUND, PSTR("FILE_NOT_FOUND"));
