@@ -76,6 +76,27 @@ wifi_client.write_text(source, encoding="utf-8")
 web_server = framework_dir / "libraries" / "WebServer" / "src" / "WebServer.cpp"
 web_source = web_server.read_text(encoding="utf-8")
 
+# Closing each short HTTP response normally leaves C3 TCP pbufs retained for
+# the lwIP close state. Abort only after WebServer has written its response so
+# polling cannot consume several KB per completed request.
+if "C3 abortive close releases retained TCP pbufs" not in web_source:
+    include_marker = '#include "WebServer.h"'
+    cleanup_marker = '''  if (!keepCurrentClient) {
+    // Explicitly release the C3 socket'''
+    if include_marker not in web_source or cleanup_marker not in web_source:
+        raise RuntimeError("Unable to apply the ESP32-C3 abortive-close patch")
+    web_source = web_source.replace(include_marker, include_marker + '\n#include <lwip/sockets.h>', 1)
+    web_source = web_source.replace(cleanup_marker, '''  if (!keepCurrentClient) {
+#ifdef CONFIG_IDF_TARGET_ESP32C3
+    // C3 abortive close releases retained TCP pbufs before the next poll.
+    // Give the radio one short opportunity to drain the queued response.
+    delay(20);
+    struct linger closeNow = {1, 0};
+    setsockopt(_currentClient.fd(), SOL_SOCKET, SO_LINGER, &closeNow, sizeof(closeNow));
+#endif
+    // Explicitly release the C3 socket''', 1)
+    web_server.write_text(web_source, encoding="utf-8")
+
 if "Explicitly release the C3 socket" not in web_source:
     old_cleanup = '''  if (!keepCurrentClient) {
     _currentClient = WiFiClient();'''
