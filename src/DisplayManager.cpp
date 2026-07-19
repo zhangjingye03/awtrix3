@@ -74,6 +74,18 @@ DisplayManager_ &DisplayManager = DisplayManager.getInstance();
 static bool appLoopPending = false;
 #ifdef ESP32_C3
 static unsigned long c3GifResumeAfter = 0;
+
+static int c3ReportedResetReason()
+{
+  const esp_reset_reason_t reason = esp_reset_reason();
+#if defined(ESP_ARDUINO_VERSION_MAJOR) && ESP_ARDUINO_VERSION_MAJOR >= 3
+  // IDF 5 reports the USB-programmer handoff as ESP_RST_USB. It is a clean
+  // boot, not a runtime fault, and maps to the established C3 API value 0.
+  if (reason == ESP_RST_USB)
+    return 0;
+#endif
+  return static_cast<int>(reason);
+}
 #endif
 
 void DisplayManager_::closeInactiveGifFiles(GifPlayer *activePlayer)
@@ -1934,7 +1946,7 @@ size_t DisplayManager_::getStats(char *buffer, size_t bufferSize)
 #ifdef ESP32_C3
   doc[F("ram_min")] = ESP.getMinFreeHeap();
   doc[F("ram_max_alloc")] = ESP.getMaxAllocHeap();
-  doc[F("reset_reason")] = static_cast<int>(esp_reset_reason());
+  doc[F("reset_reason")] = c3ReportedResetReason();
 #endif
   doc[BrightnessKey] = BRIGHTNESS;
   snprintf(valueBuffer, sizeof(valueBuffer), "%.2f", LDR_FACTOR);
@@ -1985,7 +1997,7 @@ String DisplayManager_::getStats()
 #ifdef ESP32_C3
   doc[F("ram_min")] = ESP.getMinFreeHeap();
   doc[F("ram_max_alloc")] = ESP.getMaxAllocHeap();
-  doc[F("reset_reason")] = static_cast<int>(esp_reset_reason());
+  doc[F("reset_reason")] = c3ReportedResetReason();
 #endif
   doc[BrightnessKey] = BRIGHTNESS;
   snprintf(valueBuffer, sizeof(valueBuffer), "%.2f", LDR_FACTOR);

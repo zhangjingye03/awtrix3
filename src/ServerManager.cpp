@@ -650,7 +650,11 @@ void addHandler()
                     // Let WebServer own the response lifecycle. Writing the
                     // socket directly bypasses its cleanup bookkeeping and
                     // leaves lwIP pbufs fragmented after rapid C3 polling.
+#if defined(ESP_ARDUINO_VERSION_MAJOR) && ESP_ARDUINO_VERSION_MAJOR >= 3
+                    mws.webserver->send(200, "application/json", String(statsBuffer, statsLength));
+#else
                     mws.webserver->send(200, "application/json", statsBuffer, statsLength);
+#endif
                     DisplayManager.logC3Heap("http_stats_complete");
                    });
     mws.addHandler("/api/screen", HTTP_GET, []()

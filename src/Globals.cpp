@@ -1,6 +1,7 @@
 #include "Globals.h"
 #include "Preferences.h"
 #include <WiFi.h>
+#include <esp_mac.h>
 #include <ArduinoJson.h>
 #include <LittleFS.h>
 #include "effects.h"
@@ -10,7 +11,9 @@ Preferences Settings;
 char *getID()
 {
     uint8_t mac[6];
-    WiFi.macAddress(mac);
+    // WiFi.macAddress() can report a locally administered interface MAC on
+    // Arduino-ESP32 3.x. The factory STA MAC keeps MQTT/HA identity stable.
+    esp_read_mac(mac, ESP_MAC_WIFI_STA);
     char *macStr = new char[24];
     snprintf(macStr, 24, "awtrix_%02x%02x%02x", mac[3], mac[4], mac[5]);
     if (DEBUG_MODE)

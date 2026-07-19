@@ -51,12 +51,14 @@ Current ESP32-C3 specific support includes:
 - Upstream-compatible MQTT CustomApps, including array-form `"draw": [...]` payloads
 
 Recommended PlatformIO environments:
-- `esp32-c3-fastled`: main ESP32-C3 firmware build
+- `esp32-c3-fastled`: main ESP32-C3 firmware build using Arduino-ESP32 3.x / IDF 5
+- `esp32-c3-fastled-core2017`: Arduino-ESP32 2.0.17 recovery build
 - `esp32-c3-fastled-ota`: ESP OTA upload target
 - `esp32-c3-fastled-webota`: HTTP OTA upload target
 
 Notes:
 - FastLED `3.10.x` is used for ESP32-C3 matrix compatibility and reduced WS2812 flicker.
+- The default C3 build uses Arduino-ESP32 3.x / IDF 5 because its newer Wi-Fi/lwIP stack remains stable with multiple resident CustomApps, animated GIFs, MQTT traffic, and repeated HTTP polling. The legacy Core 2 build is retained only as a recovery target.
 - The ESP32-C3 MQTT packet buffer is limited to 4 KB to preserve heap while accepting upstream CustomApp payloads up to 4 KB.
 - C3 CustomApps support text, `dp`, `dl`, `dt`, and named GIF icons. The draw parser uses bounded static storage to avoid frame-by-frame heap allocation.
 - Animated GIFs temporarily require roughly a 4 KB contiguous heap block; the heap is released after the active GIF page changes or is removed.
