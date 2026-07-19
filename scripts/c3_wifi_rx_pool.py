@@ -122,30 +122,6 @@ if "void send(int code, const char* content_type, const char* content, size_t co
         raise RuntimeError("Unable to apply the ESP32-C3 WebServer raw-response header patch")
     web_header.write_text(header_source.replace(header_marker, header_addition, 1), encoding="utf-8")
 
-web_source = web_server.read_text(encoding="utf-8")
-
-# WebServer normally closes immediately after sending a response. That makes
-# the C3 the active TCP closer, retaining one TIME_WAIT PCB per short poll.
-# HTTP responses already advertise "Connection: close", so wait briefly for
-# the client to close first; a passive close releases the C3 PCB immediately.
-if "C3 wait for peer close to avoid TIME_WAIT accumulation" not in web_source:
-    request_marker = '''          _handleRequest();
-// Fix for issue with Chrome based browsers: https://github.com/espressif/arduino-esp32/issues/3652'''
-    request_replacement = '''          _handleRequest();
-#ifdef CONFIG_IDF_TARGET_ESP32C3
-          // C3 wait for peer close to avoid TIME_WAIT accumulation.
-          if (_currentClient.connected()) {
-            _currentStatus = HC_WAIT_CLOSE;
-            _statusChange = millis();
-            keepCurrentClient = true;
-          }
-#endif
-// Fix for issue with Chrome based browsers: https://github.com/espressif/arduino-esp32/issues/3652'''
-    if request_marker not in web_source:
-        raise RuntimeError("Unable to apply the ESP32-C3 peer-close patch")
-    web_server.write_text(web_source.replace(request_marker, request_replacement, 1), encoding="utf-8")
-
-web_source = web_server.read_text(encoding="utf-8")
 source_marker = '''void WebServer::send_P(int code, PGM_P content_type, PGM_P content) {'''
 source_addition = '''void WebServer::send(int code, const char* content_type, const char* content, size_t contentLength)
 {
