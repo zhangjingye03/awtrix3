@@ -52,6 +52,9 @@ private:
   int tbiHeight;
   int tbiPackedBits;
   boolean tbiInterlaced;
+#ifdef ESP32_C3
+  uint16_t c3LoggedFrames = 0;
+#endif
 
 public:
   int frameDelay;
@@ -210,6 +213,21 @@ public:
     tbiHeight = readWord();
     tbiPackedBits = readByte();
     tbiInterlaced = ((tbiPackedBits & INTERLACEFLAG) != 0);
+
+    // GIF image descriptors are allowed to be smaller than the logical
+    // screen, but never outside our fixed 32x8 decode buffers. Reject a
+    // malformed custom icon before it can index imageData or FrameBuffer out
+    // of bounds and corrupt the C3 heap.
+    if (tbiImageX < 0 || tbiImageY < 0 || tbiWidth < 1 || tbiHeight < 1 ||
+        tbiImageX + tbiWidth > WIDTH || tbiImageY + tbiHeight > HEIGHT)
+    {
+#ifdef ESP32_C3
+      Serial.printf("[%lu] [C3GIF] invalid image rect path=%s x=%d y=%d w=%d h=%d screen=%dx%d\n",
+                    millis(), loadedPath, tbiImageX, tbiImageY, tbiWidth, tbiHeight, WIDTH, HEIGHT);
+#endif
+      file.seek(file.size());
+      return 0;
+    }
     boolean localColorTable = ((tbiPackedBits & COLORTBLFLAG) != 0);
     if (localColorTable)
     {
@@ -297,6 +315,8 @@ public:
     lzw_decode_init(lzwCodeSize, lzwImageData);
     decompressAndDisplayFrame();
     redrawLastFrame();
+    const int frameTransparency = transparentColorIndex;
+    const int frameDisposal = disposalMethod;
     transparentColorIndex = NO_TRANSPARENT_INDEX;
     disposalMethod = DISPOSAL_NONE;
     if (frameDelay < 1)
@@ -304,6 +324,16 @@ public:
       frameDelay = 1;
     }
     newframeDelay = frameDelay * 10;
+#ifdef ESP32_C3
+    if (c3LoggedFrames < 4 || (c3LoggedFrames % 120) == 0)
+    {
+      Serial.printf("[%lu] [C3GIF] frame path=%s frame=%u rect=%d,%d %dx%d palette=%d transparent=%d disposal=%d delay=%d free=%u largest=%u\n",
+                    millis(), loadedPath, currentFrame, tbiImageX, tbiImageY, tbiWidth, tbiHeight,
+                    colorCount, frameTransparency, frameDisposal, newframeDelay,
+                    ESP.getFreeHeap(), ESP.getMaxAllocHeap());
+    }
+    ++c3LoggedFrames;
+#endif
     return frameDelay * 10;
   }
 
@@ -565,6 +595,9 @@ public:
   int startLoadedGif(int x, int y, uint32_t frame)
   {
     currentFrame = 0;
+#ifdef ESP32_C3
+    c3LoggedFrames = 0;
+#endif
 
     memset(FrameBuffer, 0, sizeof(FrameBuffer));
     memset(gifPalette, 0, sizeof(gifPalette));
@@ -574,6 +607,7 @@ public:
     memset(stack, 0, sizeof(stack));
     memset(suffix, 0, sizeof(suffix));
     memset(prefix, 0, sizeof(prefix));
+    colorCount = 0;
     if (frame != 0)
     {
       parseGifHeader();
@@ -591,6 +625,11 @@ public:
       parseGlobalColorTable();
       drawFrame();
     }
+#ifdef ESP32_C3
+    Serial.printf("[%lu] [C3GIF] init path=%s screen=%dx%d palette=%d requested_frame=%u free=%u largest=%u\n",
+                  millis(), loadedPath, lsdWidth, lsdHeight, colorCount, frame,
+                  ESP.getFreeHeap(), ESP.getMaxAllocHeap());
+#endif
     return lsdWidth;
   }
 

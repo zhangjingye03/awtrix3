@@ -72,3 +72,19 @@ if "c3WiFiClientRxPool" not in source or "size=512" not in source:
     raise RuntimeError("Unable to apply the ESP32-C3 WiFiClient RX-pool patch")
 
 wifi_client.write_text(source, encoding="utf-8")
+
+web_server = framework_dir / "libraries" / "WebServer" / "src" / "WebServer.cpp"
+web_source = web_server.read_text(encoding="utf-8")
+
+if "Explicitly release the C3 socket" not in web_source:
+    old_cleanup = '''  if (!keepCurrentClient) {
+    _currentClient = WiFiClient();'''
+    new_cleanup = '''  if (!keepCurrentClient) {
+    // Explicitly release the C3 socket and its lwIP pbufs. Assigning an empty
+    // WiFiClient only drops the wrapper, which can leave rapid HTTP polling
+    // competing with the small GIF/VFS heap for several seconds.
+    _currentClient.stop();
+    _currentClient = WiFiClient();'''
+    if old_cleanup not in web_source:
+        raise RuntimeError("Unable to apply the ESP32-C3 WebServer socket-cleanup patch")
+    web_server.write_text(web_source.replace(old_cleanup, new_cleanup, 1), encoding="utf-8")

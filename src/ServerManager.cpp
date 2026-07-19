@@ -645,29 +645,13 @@ void addHandler()
     mws.addHandler("/api/stats", HTTP_GET, []()
                    {
                     char statsBuffer[512];
-                    const size_t length = DisplayManager.getStats(statsBuffer, sizeof(statsBuffer));
-#ifdef ESP32_C3
-                    // WebServer::send(const char*) builds temporary String
-                    // header/content objects. Repeated stats polling then
-                    // fragments the C3 heap. Send this fixed-size API reply
-                    // directly from the caller-owned buffer instead.
-                    char header[160];
-                    const int headerLength = snprintf(header, sizeof(header),
-                                                      "HTTP/1.1 200 OK\r\n"
-                                                      "Content-Type: application/json\r\n"
-                                                      "Content-Length: %u\r\n"
-                                                      "Access-Control-Allow-Origin: *\r\n"
-                                                      "Connection: close\r\n\r\n",
-                                                      static_cast<unsigned int>(length));
-                    WiFiClient client = mws.webserver->client();
-                    if (headerLength > 0 && static_cast<size_t>(headerLength) < sizeof(header))
-                    {
-                        client.write(reinterpret_cast<const uint8_t *>(header), headerLength);
-                        client.write(reinterpret_cast<const uint8_t *>(statsBuffer), length);
-                    }
-#else
+                    DisplayManager.logC3Heap("http_stats_entry");
+                    DisplayManager.getStats(statsBuffer, sizeof(statsBuffer));
+                    // Let WebServer own the response lifecycle. Writing the
+                    // socket directly bypasses its cleanup bookkeeping and
+                    // leaves lwIP pbufs fragmented after rapid C3 polling.
                     mws.webserver->send(200, F("application/json"), statsBuffer);
-#endif
+                    DisplayManager.logC3Heap("http_stats_complete");
                    });
     mws.addHandler("/api/screen", HTTP_GET, []()
                    {
