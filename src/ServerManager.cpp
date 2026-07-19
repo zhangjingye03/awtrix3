@@ -646,11 +646,11 @@ void addHandler()
                    {
                     char statsBuffer[512];
                     DisplayManager.logC3Heap("http_stats_entry");
-                    DisplayManager.getStats(statsBuffer, sizeof(statsBuffer));
+                    const size_t statsLength = DisplayManager.getStats(statsBuffer, sizeof(statsBuffer));
                     // Let WebServer own the response lifecycle. Writing the
                     // socket directly bypasses its cleanup bookkeeping and
                     // leaves lwIP pbufs fragmented after rapid C3 polling.
-                    mws.webserver->send(200, F("application/json"), statsBuffer);
+                    mws.webserver->send(200, "application/json", statsBuffer, statsLength);
                     DisplayManager.logC3Heap("http_stats_complete");
                    });
     mws.addHandler("/api/screen", HTTP_GET, []()

@@ -88,3 +88,33 @@ if "Explicitly release the C3 socket" not in web_source:
     if old_cleanup not in web_source:
         raise RuntimeError("Unable to apply the ESP32-C3 WebServer socket-cleanup patch")
     web_server.write_text(web_source.replace(old_cleanup, new_cleanup, 1), encoding="utf-8")
+
+# Arduino-ESP32's const char* send overload copies each response into a
+# temporary String. Stats responses are already serialized into a caller-owned
+# buffer, so that copy is avoidable and is costly during repeated C3 polling.
+web_header = framework_dir / "libraries" / "WebServer" / "src" / "WebServer.h"
+header_source = web_header.read_text(encoding="utf-8")
+header_marker = "  void send(int code, const char* content_type, const char* content);"
+header_addition = header_marker + "\n  void send(int code, const char* content_type, const char* content, size_t contentLength);"
+if "void send(int code, const char* content_type, const char* content, size_t contentLength);" not in header_source:
+    if header_marker not in header_source:
+        raise RuntimeError("Unable to apply the ESP32-C3 WebServer raw-response header patch")
+    web_header.write_text(header_source.replace(header_marker, header_addition, 1), encoding="utf-8")
+
+web_source = web_server.read_text(encoding="utf-8")
+source_marker = '''void WebServer::send_P(int code, PGM_P content_type, PGM_P content) {'''
+source_addition = '''void WebServer::send(int code, const char* content_type, const char* content, size_t contentLength)
+{
+    String header;
+    _prepareHeader(header, code, content_type, contentLength);
+    _currentClientWrite(header.c_str(), header.length());
+    if (contentLength) {
+        sendContent(content, contentLength);
+    }
+}
+
+'''
+if "void WebServer::send(int code, const char* content_type, const char* content, size_t contentLength)" not in web_source:
+    if source_marker not in web_source:
+        raise RuntimeError("Unable to apply the ESP32-C3 WebServer raw-response source patch")
+    web_server.write_text(web_source.replace(source_marker, source_addition + source_marker, 1), encoding="utf-8")
