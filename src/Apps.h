@@ -19,7 +19,7 @@ struct CustomApp
     bool bounce = false;
     uint32_t color;
     File icon;
-    bool isGif;
+    bool isGif = false;
     bool rainbow;
     bool center;
     int fade = 0;

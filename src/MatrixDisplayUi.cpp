@@ -48,6 +48,31 @@ void MatrixDisplayUi::init()
   gif2.setMatrix(this->matrix);
 }
 
+void MatrixDisplayUi::closeGifFiles()
+{
+  gif1.closeFile();
+  gif2.closeFile();
+}
+
+void MatrixDisplayUi::closeGifFilesExcept(GifPlayer *activePlayer)
+{
+#ifdef ESP32_C3
+  // Transitions use two renderers. A named GIF must only keep the renderer
+  // that is drawing the fixed page open, otherwise both LittleFS buffers
+  // consume the C3's small contiguous heap.
+  if (activePlayer != &gif1)
+  {
+    gif1.closeFile();
+  }
+  if (activePlayer != &gif2)
+  {
+    gif2.closeFile();
+  }
+#else
+  (void)activePlayer;
+#endif
+}
+
 void MatrixDisplayUi::setTargetFPS(uint8_t fps)
 {
   float oldInterval = this->updateInterval;
@@ -101,7 +126,18 @@ void MatrixDisplayUi::setAppAnimation(AnimationDirection dir)
 
 void MatrixDisplayUi::setApps(const std::vector<std::pair<String, AppCallback>> &appPairs)
 {
+  DisplayManager.logC3CustomAdmission("ui_setapps_entry");
   DisplayManager.logC3Heap("ui_setapps_entry");
+  AppCallback currentCallback = nullptr;
+  const bool wasTransitioning = this->state.appState == IN_TRANSITION;
+
+  // AppFunctions is about to be replaced. Preserve the current callback only
+  // when its index was valid in the old array; a removed custom app otherwise
+  // leaves state.currentApp pointing one past the new array.
+  if (AppFunctions != nullptr && this->state.currentApp < AppCount)
+  {
+    currentCallback = AppFunctions[this->state.currentApp];
+  }
   delete[] AppFunctions;
   DisplayManager.logC3Heap("ui_setapps_deleted");
   AppCount = appPairs.size();
@@ -111,10 +147,35 @@ void MatrixDisplayUi::setApps(const std::vector<std::pair<String, AppCallback>> 
   {
     AppFunctions[i] = appPairs[i].second;
   }
-  this->resetState();
-  DisplayManager.logC3Heap("ui_setapps_before_loop");
-  DisplayManager.sendAppLoop();
-  DisplayManager.logC3Heap("ui_setapps_after_loop");
+
+  int16_t preservedIndex = -1;
+  if (!wasTransitioning && currentCallback != nullptr)
+  {
+    for (size_t i = 0; i < AppCount; ++i)
+    {
+      if (AppFunctions[i] == currentCallback)
+      {
+        preservedIndex = static_cast<int16_t>(i);
+        break;
+      }
+    }
+  }
+
+  if (preservedIndex >= 0)
+  {
+    this->state.currentApp = static_cast<uint8_t>(preservedIndex);
+  }
+  else
+  {
+#ifdef ESP32_C3
+    Serial.printf("[%lu] [C3GIF] ui reset after app rebuild old=%u new_count=%u transition=%u\n",
+                  millis(), this->state.currentApp, AppCount, wasTransitioning);
+#endif
+    this->forceResetState();
+  }
+  DisplayManager.logC3CustomAdmission("ui_setapps_queue_loop");
+  DisplayManager.queueAppLoop();
+  DisplayManager.logC3CustomAdmission("ui_setapps_complete");
   DisplayManager.setAutoTransition(true);
 }
 
@@ -434,6 +495,11 @@ void MatrixDisplayUi::drawApp()
 
 bool MatrixDisplayUi::isCurrentAppValid()
 {
+  if (AppFunctions == nullptr || AppCount == 0 || this->state.currentApp >= AppCount)
+  {
+    return false;
+  }
+
   for (size_t i = 0; i < AppCount; ++i)
   {
     if (AppFunctions[i] == AppFunctions[this->state.currentApp])

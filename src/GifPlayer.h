@@ -70,6 +70,7 @@ public:
   byte lzwImageData[1280];
   char tempBuffer[260];
   File file;
+  char loadedPath[80] = {};
   byte imageData[WIDTH * HEIGHT];
   byte imageDataBU[WIDTH * HEIGHT];
 
@@ -538,6 +539,96 @@ public:
     return currentFrame;
   }
 
+  // The renderer owns a copy of the LittleFS file used by a custom GIF. Close
+  // it explicitly when the page leaves the app loop so its read buffer is not
+  // retained by either transition renderer on the memory-constrained C3.
+  void closeFile()
+  {
+#ifdef ESP32_C3
+    if (file)
+    {
+      Serial.printf("[%lu] [C3GIF] decoder close file=%s frame=%u\n",
+                    millis(), file.name(), currentFrame);
+    }
+#endif
+    if (file)
+    {
+      file.close();
+    }
+    file = File();
+    loadedPath[0] = '\0';
+    currentFrame = 0;
+    lsdWidth = 0;
+    lsdHeight = 0;
+  }
+
+  int startLoadedGif(int x, int y, uint32_t frame)
+  {
+    currentFrame = 0;
+
+    memset(FrameBuffer, 0, sizeof(FrameBuffer));
+    memset(gifPalette, 0, sizeof(gifPalette));
+    memset(lzwImageData, 0, sizeof(lzwImageData));
+    memset(imageData, 0, sizeof(imageData));
+    memset(imageDataBU, 0, sizeof(imageDataBU));
+    memset(stack, 0, sizeof(stack));
+    memset(suffix, 0, sizeof(suffix));
+    memset(prefix, 0, sizeof(prefix));
+    if (frame != 0)
+    {
+      parseGifHeader();
+      parseLogicalScreenDescriptor();
+      parseGlobalColorTable();
+      do
+      {
+        drawFrame(true);
+      } while (currentFrame < frame);
+    }
+    else
+    {
+      parseGifHeader();
+      parseLogicalScreenDescriptor();
+      parseGlobalColorTable();
+      drawFrame();
+    }
+    return lsdWidth;
+  }
+
+  int playGif(int x, int y, const char *path, uint32_t frame = 0)
+  {
+    offsetX = x;
+    offsetY = y;
+    if (file && strcmp(loadedPath, path) == 0)
+    {
+      drawFrame();
+      return lsdWidth;
+    }
+
+    closeFile();
+    file = LittleFS.open(path, "r");
+    if (!file)
+    {
+#ifdef ESP32_C3
+      Serial.printf("[%lu] [C3GIF] decoder open failed file=%s\n", millis(), path);
+#endif
+      return 0;
+    }
+#ifdef ESP32_C3
+    // Arduino's VFS assigns a 4 KB stdio buffer to each File by default.
+    // GIF decoding reads compact sequential blocks, so 512 B is sufficient
+    // and leaves enough contiguous heap for Wi-Fi and HTTP while animating.
+    if (!file.setBufferSize(512))
+    {
+      Serial.printf("[%lu] [C3GIF] unable to reduce file buffer for %s\n", millis(), path);
+    }
+#endif
+    strlcpy(loadedPath, path, sizeof(loadedPath));
+#ifdef ESP32_C3
+    Serial.printf("[%lu] [C3GIF] decoder open file=%s requested_frame=%u\n", millis(), path, frame);
+#endif
+    return startLoadedGif(x, y, frame);
+  }
+
   int playGif(int x, int y, File *imageFile, uint32_t frame = 0)
   {
     offsetX = x;
@@ -550,35 +641,12 @@ public:
     }
     else
     {
-      currentFrame = 0;
+#ifdef ESP32_C3
+      Serial.printf("[%lu] [C3GIF] decoder switch from=%s to=%s requested_frame=%u\n",
+                    millis(), file ? file.name() : "<none>", imageFile->name(), frame);
+#endif
       file = *imageFile;
-
-      memset(FrameBuffer, 0, sizeof(FrameBuffer));
-      memset(gifPalette, 0, sizeof(gifPalette));
-      memset(lzwImageData, 0, sizeof(lzwImageData));
-      memset(imageData, 0, sizeof(imageData));
-      memset(imageDataBU, 0, sizeof(imageDataBU));
-      memset(stack, 0, sizeof(stack));
-      memset(suffix, 0, sizeof(suffix));
-      memset(prefix, 0, sizeof(prefix));
-      if (frame != 0)
-      {
-
-        parseGifHeader();
-        parseLogicalScreenDescriptor();
-        parseGlobalColorTable();
-        do
-        {
-          drawFrame(true);
-        } while (currentFrame < frame);
-      }
-      else
-      {
-        parseGifHeader();
-        parseLogicalScreenDescriptor();
-        parseGlobalColorTable();
-        drawFrame();
-      }
+      return startLoadedGif(x, y, frame);
     }
     return lsdWidth;
   }

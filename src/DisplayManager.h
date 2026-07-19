@@ -7,6 +7,7 @@
 #include <vector>
 #include <FastLED_NeoMatrix.h>
 
+class GifPlayer;
 
 class DisplayManager_
 {
@@ -20,6 +21,10 @@ public:
     bool appIsSwitching;
     bool showGif;
     void setup();
+    void closeInactiveGifFiles(GifPlayer *activePlayer);
+    void prepareForHttpRequest();
+    bool isGifPausedForHttp() const;
+    void releaseGifMemory();
     void tick();
     void clear();
     void show();
@@ -39,6 +44,9 @@ public:
     void selectButtonLong();
     void setBrightness(int);
     void logC3Heap(const char *stage);
+    // Request-path trace.  Unlike heap logging, this is intentionally not
+    // rate limited so one HTTP admission can be followed end to end.
+    void logC3CustomAdmission(const char *stage);
     bool generateNotification(uint8_t source, const char *json);
     bool generateCustomPage(const String &name, JsonObject doc, bool preventSave);
     void printText(int16_t x, int16_t y, const char *text, bool centered, byte textCase);
@@ -73,7 +81,9 @@ public:
     bool indicatorParser(uint8_t indicator, const char *json);
     void showSleepAnimation();
     void sendAppLoop();
+    void queueAppLoop();
     void processDrawInstructions(int16_t x, int16_t y, String &drawInstructions);
+    size_t ledsAsJson(char *buffer, size_t bufferSize);
     String ledsAsJson();
     String getAppsWithIcon();
     void startArtnet();

@@ -1,5 +1,48 @@
 #include "esp-fs-webserver.h"
 
+static void sendGzipPage(WebServerClass *server, PGM_P content, size_t length)
+{
+    // A single 12+ KB write exhausts the C3 TCP send buffer. Chunking also
+    // yields to the Wi-Fi task while a browser loads the embedded pages.
+    // The WebServer chunked-response footer is written directly to WiFiClient
+    // and bypasses the C3 retry wrapper. Embedded pages have a known size, so
+    // use Content-Length and keep every body write on the safe path.
+    server->setContentLength(length);
+    server->sendHeader("Content-Encoding", "gzip");
+    server->send(200, "text/html", "");
+
+    constexpr size_t chunkSize = 512;
+    for (size_t offset = 0; offset < length; offset += chunkSize)
+    {
+        const size_t remaining = length - offset;
+        server->sendContent_P(content + offset, min(chunkSize, remaining));
+        delay(0);
+    }
+}
+
+#ifdef ESP32_C3
+static const char C3_WIFI_SETUP_HTML[] PROGMEM =
+    "<!doctype html><meta name=viewport content='width=device-width,initial-scale=1'>"
+    "<title>AWTRIX C3</title><style>body{font:16px sans-serif;max-width:34rem;margin:2rem auto;padding:0 1rem}"
+    "input,button{box-sizing:border-box;margin:.25rem 0;padding:.55rem;width:100%}h2{margin-top:1.6rem}small{color:#555}</style>"
+    "<h1>AWTRIX C3</h1><h2>Wi-Fi</h2><form method=post action=/connect><input required name=ssid placeholder=SSID>"
+    "<input required name=password type=password placeholder=Password><button>Connect</button></form>"
+    "<p><a href=/scan>Scan</a> | <a href=/status>Status</a> | <a href=/api/stats>Device stats</a> | <a href=/screen>Live view</a></p>"
+    "<h2>MQTT</h2><form id=m><input id=h placeholder='Broker host' required><input id=p type=number placeholder=Port>"
+    "<input id=u placeholder=Username><input id=w type=password placeholder=Password><input id=x placeholder='Topic prefix'>"
+    "<label><input id=d type=checkbox style=width:auto> Home Assistant discovery</label><button>Save MQTT and reboot</button></form>"
+    "<h2>Icon upload</h2><form id=i><input id=n placeholder='Icon name, e.g. test.gif' required><input id=f type=file accept='.gif,.jpg,.jpeg' required>"
+    "<button>Upload to /ICONS</button></form><small id=s></small><p><a href=/restart>Restart device</a></p>"
+    "<script>const q=id=>document.getElementById(id),s=q('s');fetch('/api/c3/mqtt').then(r=>r.json()).then(v=>{h.value=v.host||'';p.value=v.port||1883;u.value=v.user||'';x.value=v.prefix||'';d.checked=!!v.discovery}).catch(()=>{});"
+    "q('m').onsubmit=async e=>{e.preventDefault();let v={host:h.value,port:+p.value||1883,user:u.value,prefix:x.value,discovery:d.checked};if(w.value)v.pass=w.value;let r=await fetch('/api/c3/mqtt',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(v)});s.textContent=r.ok?'Saved. Rebooting...':'Save failed';if(r.ok)setTimeout(()=>fetch('/api/reboot',{method:'POST'}),300)};"
+    "q('i').onsubmit=async e=>{e.preventDefault();let z=q('n').value.replace(/^.*[\\/]/,''),f=q('f').files[0];if(!/^[\\w.-]+\\.(gif|jpe?g)$/i.test(z)){s.textContent='Use a .gif or .jpg filename';return}if(!f||f.size>32768){s.textContent='Icons must be 1-32 KB';return}s.textContent='Uploading...';let b=new Uint8Array(await f.arrayBuffer());try{for(let o=0;o<b.length;o+=384){let v='';for(let k=o;k<Math.min(o+384,b.length);k++)v+=String.fromCharCode(b[k]);let r=await fetch('/api/c3/icon',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({name:z,data:btoa(v),start:o===0,final:o+384>=b.length})});if(!r.ok)throw Error(r.status);s.textContent='Uploading '+Math.min(100,Math.ceil((o+384)*100/b.length))+'%'}s.textContent='Icon uploaded'}catch(x){s.textContent='Upload failed'}};</script>";
+
+static void sendC3WifiSetup(WebServerClass *server)
+{
+    server->send_P(200, PSTR("text/html"), C3_WIFI_SETUP_HTML, sizeof(C3_WIFI_SETUP_HTML) - 1);
+}
+#endif
+
 FSWebServer::FSWebServer(fs::FS &fs, WebServerClass &server)
 {
     m_filesystem = &fs;
@@ -414,12 +457,19 @@ void FSWebServer::handleScanNetworks()
 {
     String jsonList = "[";
     DebugPrint("Scanning WiFi networks...");
+#ifdef ESP32_C3
+    // The default active scan dwells on every channel long enough to lose AP
+    // beacons on the C3. Use a short passive scan while already associated.
+    int n = WiFi.scanNetworks(false, true, true, 40);
+#else
     int n = WiFi.scanNetworks();
+#endif
     DebugPrintln(" complete.");
     if (n == 0)
     {
         DebugPrintln("no networks found");
         webserver->send(200, "text/json", "[]");
+        WiFi.scanDelete();
         return;
     }
     else
@@ -448,6 +498,7 @@ void FSWebServer::handleScanNetworks()
         jsonList += "]";
     }
     webserver->send(200, "text/json", jsonList);
+    WiFi.scanDelete();
     DebugPrintln(jsonList);
 }
 
@@ -524,8 +575,11 @@ void FSWebServer::removeWhiteSpaces(String &str)
 
 void FSWebServer::handleSetup()
 {
-    webserver->sendHeader(PSTR("Content-Encoding"), "gzip");
-    webserver->send_P(200, "text/html", SETUP_HTML, SETUP_HTML_SIZE);
+#ifdef ESP32_C3
+    sendC3WifiSetup(webserver);
+#else
+    sendGzipPage(webserver, SETUP_HTML, SETUP_HTML_SIZE);
+#endif
 }
 #endif
 
@@ -542,7 +596,11 @@ void FSWebServer::handleIndex()
 #ifdef INCLUDE_SETUP_HTM
     else
     {
+#ifdef ESP32_C3
+        sendC3WifiSetup(webserver);
+#else
         handleSetup();
+#endif
     }
 #endif
 }
@@ -560,6 +618,16 @@ bool FSWebServer::handleFileRead(const String &uri)
     {
         path += "index.htm";
     }
+#ifdef ESP32_C3
+    // LittleFS icons are decoded locally by the matrix and uploaded through
+    // /api/c3/icon. Sending GIFs through the synchronous WebServer can hold
+    // the only HTTP loop in WiFiClient's ten-second EAGAIN retry path.
+    if (path.startsWith("/ICONS/"))
+    {
+        webserver->send(503, F("text/plain"), F("Icon downloads are unavailable on ESP32-C3"));
+        return true;
+    }
+#endif
     String pathWithGz = path + ".gz";
 
     if (m_filesystem->exists(pathWithGz) || m_filesystem->exists(path))
@@ -593,6 +661,11 @@ void FSWebServer::handleFileUpload()
     HTTPUpload &upload = webserver->upload();
     if (upload.status == UPLOAD_FILE_START)
     {
+#ifdef ESP32_C3
+        // The synchronous C3 server has one client slot. Avoid buffering a
+        // browser upload longer than LittleFS and Wi-Fi can safely service.
+        webserver->client().setNoDelay(true);
+#endif
         String filename = upload.filename;
         String result;
         // Make sure paths always start with "/"
@@ -608,16 +681,39 @@ void FSWebServer::handleFileUpload()
         }
 
         DebugPrintf_P(PSTR("handleFileUpload Name: %s\n"), filename.c_str());
-        m_uploadFile = m_filesystem->open(filename, "w");
+        m_uploadPath = filename;
+        m_uploadFile = m_filesystem->open(m_uploadPath, "w");
         if (!m_uploadFile)
         {
+            m_uploadPath = String();
             replyToCLient(ERROR, PSTR("CREATE FAILED"));
             return;
         }
         DebugPrintf_P(PSTR("Upload: START, filename: %s\n"), filename.c_str());
+#ifdef ESP32_C3
+        DebugPrintf_P(PSTR("C3 upload start: %s\n"), filename.c_str());
+#endif
     }
     else if (upload.status == UPLOAD_FILE_WRITE)
     {
+#ifdef ESP32_C3
+        constexpr size_t c3MaxUploadSize = 32 * 1024;
+        if (upload.totalSize > c3MaxUploadSize)
+        {
+            if (m_uploadFile)
+            {
+                m_uploadFile.close();
+                m_uploadFile = File();
+            }
+            if (m_uploadPath.length())
+            {
+                m_filesystem->remove(m_uploadPath);
+                m_uploadPath = String();
+            }
+            replyToCLient(ERROR, PSTR("UPLOAD TOO LARGE"));
+            return;
+        }
+#endif
         if (m_uploadFile)
         {
             size_t bytesWritten = m_uploadFile.write(upload.buf, upload.currentSize);
@@ -626,6 +722,10 @@ void FSWebServer::handleFileUpload()
                 replyToCLient(ERROR, PSTR("WRITE FAILED"));
                 return;
             }
+#ifdef ESP32_C3
+            // Let the Wi-Fi task drain incoming TCP data between LittleFS writes.
+            delay(0);
+#endif
         }
         DebugPrintf_P(PSTR("Upload: WRITE, Bytes: %d\n"), upload.currentSize);
     }
@@ -634,8 +734,32 @@ void FSWebServer::handleFileUpload()
         if (m_uploadFile)
         {
             m_uploadFile.close();
+            m_uploadFile = File();
         }
         DebugPrintf_P(PSTR("Upload: END, Size: %d\n"), upload.totalSize);
+#ifdef ESP32_C3
+        DebugPrintf_P(PSTR("C3 upload complete: %u bytes\n"), upload.totalSize);
+#endif
+        m_uploadPath = String();
+    }
+    else if (upload.status == UPLOAD_FILE_ABORTED)
+    {
+        // The synchronous framework aborts a multipart parse when the peer
+        // disconnects or times out. Do not leave a zero-byte/partial icon
+        // behind, otherwise a later GIF lookup treats it as a valid asset.
+        if (m_uploadFile)
+        {
+            m_uploadFile.close();
+            m_uploadFile = File();
+        }
+        if (m_uploadPath.length())
+        {
+            m_filesystem->remove(m_uploadPath);
+#ifdef ESP32_C3
+            DebugPrintf_P(PSTR("C3 upload aborted; removed partial file: %s\n"), m_uploadPath.c_str());
+#endif
+            m_uploadPath = String();
+        }
     }
 }
 
@@ -754,9 +878,13 @@ void FSWebServer::handleFileList()
 
     File root = m_filesystem->open(path, "r");
     path = String();
-    String output;
-    output.reserve(256);
-    output = "[";
+
+    // The editor can list hundreds of icons and GIFs. Stream the JSON entries
+    // instead of growing one large String and fragmenting the C3 heap.
+    webserver->setContentLength(CONTENT_LENGTH_UNKNOWN);
+    webserver->send(200, "application/json", "");
+    webserver->sendContent("[", 1);
+    bool first = true;
     if (root.isDirectory())
     {
         File file = root.openNextFile();
@@ -767,22 +895,29 @@ void FSWebServer::handleFileList()
             {
                 filename.remove(0, filename.lastIndexOf("/") + 1);
             }
-            if (output != "[")
+            if (!first)
             {
-                output += ',';
+                webserver->sendContent(",", 1);
             }
-            output += "{\"type\":\"";
-            output += (file.isDirectory()) ? "dir" : "file";
-            output += "\",\"size\":\"";
-            output += file.size();
-            output += "\",\"name\":\"";
-            output += filename;
-            output += "\"}";
+            first = false;
+
+            char entry[192];
+            const int length = snprintf(entry, sizeof(entry),
+                                        "{\"type\":\"%s\",\"size\":\"%u\",\"name\":\"%s\"}",
+                                        file.isDirectory() ? "dir" : "file",
+                                        static_cast<unsigned int>(file.size()),
+                                        filename.c_str());
+            if (length > 0 && static_cast<size_t>(length) < sizeof(entry))
+            {
+                webserver->sendContent(entry, static_cast<size_t>(length));
+            }
+            file.close();
             file = root.openNextFile();
         }
     }
-    output += "]";
-    webserver->send(200, "text/json", output);
+    root.close();
+    webserver->sendContent("]", 1);
+    webserver->sendContent("", 0);
 }
 
 /*
@@ -921,9 +1056,12 @@ void FSWebServer::handleFileDelete()
 */
 void FSWebServer::handleGetEdit()
 {
-#ifdef INCLUDE_EDIT_HTM
-    webserver->sendHeader(PSTR("Content-Encoding"), "gzip");
-    webserver->send_P(200, "text/html", edit_htm_gz, sizeof(edit_htm_gz));
+#ifdef ESP32_C3
+    // The embedded editor is too large for the synchronous C3 WebServer and
+    // can block Wi-Fi while its TCP socket is congested.
+    webserver->send(503, "text/plain", "File editor is unavailable on ESP32-C3.");
+#elif defined(INCLUDE_EDIT_HTM)
+    sendGzipPage(webserver, edit_htm_gz, sizeof(edit_htm_gz));
 #else
     replyToCLient(NOT_FOUND, PSTR("FILE_NOT_FOUND"));
 #endif

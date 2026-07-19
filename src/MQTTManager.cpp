@@ -49,6 +49,10 @@ static bool c3LightHaDiscoveryPending = false;
 static uint8_t c3LightHaDiscoveryStep = 0;
 static unsigned long c3LightHaDiscoveryLastPublish = 0;
 static bool c3AvailabilityWasConnected = false;
+static bool c3SubscriptionsPending = false;
+static size_t c3SubscriptionIndex = 0;
+static unsigned long c3LastSubscriptionMillis = 0;
+static constexpr unsigned long C3_SUBSCRIPTION_INTERVAL_MS = 250;
 #endif
 
 static const char *ld2402MotionText()
@@ -887,6 +891,23 @@ void onMqttConnected()
         "/ha/brightness_mode",
         "/ha/transition",
         "/ha/transition_effect"};
+#ifdef ESP32_C3
+    // ArduinoHA invokes this callback from mqtt.loop(). Sending every
+    // subscription here fills the C3 TCP send buffer before it can process
+    // broker acknowledgements. Queue them for the regular loop instead.
+    for (const char *topic : topics)
+    {
+        const String fullTopic = MQTT_PREFIX + topic;
+        if (std::find(topicsToSubscribe.begin(), topicsToSubscribe.end(), fullTopic) == topicsToSubscribe.end())
+        {
+            topicsToSubscribe.push_back(fullTopic);
+        }
+    }
+    c3SubscriptionIndex = 0;
+    c3LastSubscriptionMillis = 0;
+    c3SubscriptionsPending = true;
+    return;
+#else
     for (const char *topic : topics)
     {
         if (DEBUG_MODE)
@@ -902,11 +923,6 @@ void onMqttConnected()
             Serial.printf("Subscribed to topic %s\n", topic.c_str());
     }
     topicsToSubscribe.clear();
-
-#ifdef ESP32_C3
-    publishC3AvailabilityIfNeeded();
-    MQTTManager.publish("stats/device_topic", MQTT_PREFIX.c_str());
-#endif
 
       delay(200);
       if (HA_DISCOVERY)
@@ -924,11 +940,25 @@ void onMqttConnected()
     }
 #endif
       connected = true;
+#endif
   }
 
 bool MQTTManager_::subscribe(const char *topic)
 {
-    mqttValues[topic] = "N/A";
+    if (mqttValues.find(topic) == mqttValues.end())
+    {
+        mqttValues[topic] = "N/A";
+    }
+#ifdef ESP32_C3
+    if (mqtt.isConnected() && !c3SubscriptionsPending)
+    {
+        mqtt.subscribe(topic);
+    }
+    else if (std::find(topicsToSubscribe.begin(), topicsToSubscribe.end(), topic) == topicsToSubscribe.end())
+    {
+        topicsToSubscribe.push_back(topic);
+    }
+#else
     if (mqtt.isConnected())
     {
         mqtt.subscribe(topic);
@@ -937,6 +967,7 @@ bool MQTTManager_::subscribe(const char *topic)
     {
         topicsToSubscribe.push_back(topic);
     }
+#endif
     return true;
 }
 
@@ -1310,8 +1341,38 @@ void MQTTManager_::tick()
     }
     unsigned long currentMillis_Stats = millis();
 #ifdef ESP32_C3
+    if (c3SubscriptionsPending && mqtt.isConnected() && currentMillis_Stats - c3LastSubscriptionMillis >= C3_SUBSCRIPTION_INTERVAL_MS)
+    {
+        if (c3SubscriptionIndex < topicsToSubscribe.size())
+        {
+            const String &topic = topicsToSubscribe[c3SubscriptionIndex++];
+            if (DEBUG_MODE)
+                DEBUG_PRINTF("Subscribe to topic %s", topic.c_str());
+            mqtt.subscribe(topic.c_str());
+            c3LastSubscriptionMillis = currentMillis_Stats;
+        }
+        else
+        {
+            topicsToSubscribe.clear();
+            c3SubscriptionIndex = 0;
+            c3SubscriptionsPending = false;
+            publishC3AvailabilityIfNeeded();
+            publish("stats/device_topic", MQTT_PREFIX.c_str());
+            if (HA_DISCOVERY)
+            {
+                myOwnID->setValue(MQTT_PREFIX.c_str());
+                version->setValue(VERSION);
+            }
+            connected = true;
+        }
+    }
     publishC3AvailabilityIfNeeded();
-    publishC3HaDiscoveryTick(currentMillis_Stats);
+    // Discovery is nonessential and creates transient MQTT buffers. Defer it
+    // while a custom GIF holds the C3's LittleFS/decoder working set.
+    if (!DisplayManager.showGif)
+    {
+        publishC3HaDiscoveryTick(currentMillis_Stats);
+    }
 #endif
 #ifdef ESP32_C3
     if ((currentMillis_Stats - previousMillis_Stats >= MQTT_C3_STATS_INTERVAL) && SENSORS_STABLE)

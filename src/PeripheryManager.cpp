@@ -1152,10 +1152,20 @@ void PeripheryManager_::tick()
         if (AUTO_BRIGHTNESS && !MATRIX_OFF)
         {
             const uint8_t autoBrightness = calculateAutoBrightness();
-            if (abs(static_cast<int>(autoBrightness) - BRIGHTNESS) >= 2)
+            bool canUpdateBrightness = true;
+#ifdef ESP32_C3
+            // BH1750 readings can vary faster than a display update needs to.
+            // Avoid rapidly oscillating brightness and serial allocations on C3.
+            static unsigned long lastC3BrightnessUpdate = 0;
+            canUpdateBrightness = currentMillis_LDR - lastC3BrightnessUpdate >= 500;
+#endif
+            if (canUpdateBrightness && abs(static_cast<int>(autoBrightness) - BRIGHTNESS) >= 2)
             {
                 BRIGHTNESS = autoBrightness;
                 DisplayManager.setBrightness(BRIGHTNESS);
+#ifdef ESP32_C3
+                lastC3BrightnessUpdate = currentMillis_LDR;
+#endif
             }
         }
     }

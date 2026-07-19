@@ -71,17 +71,85 @@ DisplayManager_ &DisplayManager_::getInstance()
 
 DisplayManager_ &DisplayManager = DisplayManager.getInstance();
 
+static bool appLoopPending = false;
+#ifdef ESP32_C3
+static unsigned long c3GifResumeAfter = 0;
+#endif
+
+void DisplayManager_::closeInactiveGifFiles(GifPlayer *activePlayer)
+{
+#ifdef ESP32_C3
+  ui->closeGifFilesExcept(activePlayer);
+#else
+  (void)activePlayer;
+#endif
+}
+
+void DisplayManager_::prepareForHttpRequest()
+{
+#ifdef ESP32_C3
+  // Keep the decoder closed until WebServer/lwIP has released the request's
+  // TCP buffers. Reopening it in the same frame fragments the C3 heap and
+  // makes the next request fail before its handler can run.
+  c3GifResumeAfter = millis() + 400;
+  if (showGif)
+  {
+    // WebServer's WiFiClient allocates its RX buffer lazily. Release the
+    // active GIF's LittleFS buffer before request parsing so this allocation
+    // cannot fail midway through a request and strand the HTTP socket.
+    ui->closeGifFiles();
+    showGif = false;
+    Serial.printf("[%lu] [C3HTTP] GIF decoder paused for HTTP free=%u largest=%u\n",
+                  millis(), ESP.getFreeHeap(), ESP.getMaxAllocHeap());
+  }
+#endif
+}
+
+bool DisplayManager_::isGifPausedForHttp() const
+{
+#ifdef ESP32_C3
+  return static_cast<long>(millis() - c3GifResumeAfter) < 0;
+#else
+  return false;
+#endif
+}
+
+void DisplayManager_::releaseGifMemory()
+{
+#ifdef ESP32_C3
+  ui->closeGifFiles();
+  showGif = false;
+#endif
+}
+
+void DisplayManager_::logC3CustomAdmission(const char *stage)
+{
+#ifdef ESP32_C3
+  Serial.printf("[%lu] [C3CUSTOM] %s free=%u largest=%u\n",
+                millis(), stage, ESP.getFreeHeap(), ESP.getMaxAllocHeap());
+#else
+  (void)stage;
+#endif
+}
+
 void DisplayManager_::logC3Heap(const char *stage)
 {
 #ifdef ESP32_C3
   // Fixed slots keep heap diagnostics from allocating while measuring a low-memory path.
+  // There are more call sites than slots, so also cap the aggregate rate. Without
+  // that cap untracked render stages can flood the synchronous USB serial path.
   struct HeapLogSlot
   {
     const char *stage;
     unsigned long lastLog;
   };
   static HeapLogSlot slots[48] = {};
+  static unsigned long lastAnyLog = 0;
   const unsigned long now = millis();
+
+  if (now - lastAnyLog < 2000)
+    return;
+
   HeapLogSlot *slot = nullptr;
 
   for (HeapLogSlot &candidate : slots)
@@ -104,11 +172,15 @@ void DisplayManager_::logC3Heap(const char *stage)
     slot->lastLog = now;
   }
 
-  DEBUG_PRINTF("[C3HEAP] %s free=%u largest=%u min=%u",
-               stage,
-               ESP.getFreeHeap(),
-               heap_caps_get_largest_free_block(MALLOC_CAP_8BIT),
-               ESP.getMinFreeHeap());
+  lastAnyLog = now;
+  // Do not use DEBUG_PRINTF here: it constructs a temporary String, which
+  // changes exactly the heap path this diagnostic is intended to measure.
+  Serial.printf("[%lu] [C3HEAP] %s free=%u largest=%u min=%u\n",
+                now,
+                stage,
+                ESP.getFreeHeap(),
+                heap_caps_get_largest_free_block(MALLOC_CAP_8BIT),
+                ESP.getMinFreeHeap());
 #else
   (void)stage;
 #endif
@@ -134,7 +206,16 @@ void DisplayManager_::setBrightness(int bri)
 
   if (DEBUG_MODE)
   {
+#ifdef ESP32_C3
+    static unsigned long lastBrightnessLog = 0;
+    if (millis() - lastBrightnessLog >= 1000)
+    {
+      lastBrightnessLog = millis();
+      DEBUG_PRINTF("Brightness set to %d, auto=%s, matrixOff=%s", bri, AUTO_BRIGHTNESS ? "true" : "false", MATRIX_OFF ? "true" : "false");
+    }
+#else
     DEBUG_PRINTF("Brightness set to %d, auto=%s, matrixOff=%s", bri, AUTO_BRIGHTNESS ? "true" : "false", MATRIX_OFF ? "true" : "false");
+#endif
   }
 }
 
@@ -385,10 +466,9 @@ void pushCustomApp(String name, int position)
     }
 
     DisplayManager.logC3Heap("custom_vector_after");
-    DisplayManager.logC3Heap("custom_ui_before");
-    ui->setApps(Apps); // Add Apps
-    DisplayManager.logC3Heap("custom_ui_after");
-    DisplayManager.getInstance().setAutoTransition(true);
+    // The caller commits customApps before rebuilding the UI.  setApps()
+    // publishes the loop and must never observe an Apps entry without its
+    // corresponding CustomApp.
   }
 }
 
@@ -423,6 +503,22 @@ bool deleteCustomAppFile(const String &name)
 void removeCustomAppFromApps(const String &name, bool setApps)
 {
   DisplayManager.logC3Heap("custom_remove_entry");
+  const bool removedActiveApp = currentCustomApp.startsWith(name);
+#ifdef ESP32_C3
+  Serial.printf("[%lu] [C3GIF] remove begin name=%s active=%u current=%s apps=%u custom=%u\n",
+                millis(), name.c_str(), removedActiveApp, currentCustomApp.c_str(),
+                static_cast<unsigned int>(Apps.size()), static_cast<unsigned int>(customApps.size()));
+  if (removedActiveApp)
+  {
+    // Do this before destroying the CustomApp that owns the source File.
+    // The renderers keep their own File copies, but both must be released
+    // before the UI callback array is rebuilt.
+    ui->closeGifFiles();
+    currentCustomApp = "";
+    DisplayManager.showGif = false;
+    Serial.printf("[%lu] [C3GIF] active decoder files closed\n", millis());
+  }
+#endif
   // Remove apps from Apps list
   DisplayManager.logC3Heap("custom_erase_apps_before");
   auto it = Apps.begin();
@@ -460,10 +556,18 @@ void removeCustomAppFromApps(const String &name, bool setApps)
     DisplayManager.logC3Heap("custom_remove_ui_before");
     ui->setApps(Apps);
     DisplayManager.logC3Heap("custom_remove_ui_after");
+#ifdef ESP32_C3
+    Serial.printf("[%lu] [C3GIF] remove setApps complete count=%u current_index=%u\n",
+                  millis(), static_cast<unsigned int>(Apps.size()), ui->getUiState()->currentApp);
+#endif
   }
   DisplayManager.getInstance().setAutoTransition(true);
   deleteCustomAppFile(name);
   DisplayManager.setAppTime(TIME_PER_APP);
+#ifdef ESP32_C3
+  Serial.printf("[%lu] [C3GIF] remove complete name=%s free=%u largest=%u\n",
+                millis(), name.c_str(), ESP.getFreeHeap(), ESP.getMaxAllocHeap());
+#endif
   DisplayManager.logC3Heap("custom_remove_complete");
 }
 
@@ -494,6 +598,7 @@ bool parseFragmentsText(const JsonArray &fragmentArray, std::vector<uint32_t> &c
 
 bool DisplayManager_::parseCustomPage(const String &name, const char *json, bool preventSave)
 {
+  logC3CustomAdmission("parse_begin");
   logC3Heap("custom_outer_entry");
   if ((strcmp(json, "") == 0) || (strcmp(json, "{}") == 0))
   {
@@ -512,6 +617,7 @@ bool DisplayManager_::parseCustomPage(const String &name, const char *json, bool
 #endif
   DeserializationError error = deserializeJson(doc, json);
   logC3Heap("custom_outer_parsed");
+  logC3CustomAdmission(error ? "parse_failed" : "parse_json_complete");
   if (error)
   {
     DEBUG_PRINTF("Custom app '%s' rejected: %s (payload=%u bytes, JSON capacity=%u)",
@@ -870,11 +976,21 @@ bool DisplayManager_::generateCustomPage(const String &name, JsonObject doc, boo
   customApp.lastUpdate = millis();
   customApp.lifeTimeEnd = false;
   doc.clear();
+  const bool needsUiRebuild = customApps.count(name) == 0;
+  logC3CustomAdmission("insert_apps_begin");
   logC3Heap("custom_insert_before");
   pushCustomApp(name, pos - 1);
   logC3Heap("custom_map_assign_before");
   customApps[name] = customApp;
   logC3Heap("custom_map_assign_after");
+  logC3CustomAdmission("insert_map_committed");
+  if (needsUiRebuild)
+  {
+    logC3CustomAdmission("setapps_begin");
+    ui->setApps(Apps);
+    logC3CustomAdmission("setapps_complete");
+    setAutoTransition(true);
+  }
   logC3Heap("custom_insert_after");
 
   return true;
@@ -1186,7 +1302,15 @@ void DisplayManager_::loadCustomApps()
     }
 
     String fileName = file.name();
-    String json = "";
+    String json;
+    const size_t jsonSize = file.size();
+    if (!json.reserve(jsonSize))
+    {
+      DEBUG_PRINTF("Skipping custom app '%s': cannot reserve %u bytes", fileName.c_str(), jsonSize);
+      file.close();
+      file = root.openNextFile();
+      continue;
+    }
     while (file.available())
     {
       json += char(file.read());
@@ -1296,6 +1420,17 @@ void ResetCustomApps()
       app.currentFrame = 0;
     }
   }
+
+#ifdef ESP32_C3
+  auto activeApp = customApps.find(currentCustomApp);
+  DisplayManager.showGif = activeApp != customApps.end() && activeApp->second.isGif;
+  // This runs after a transition completes. At that point no GIF renderer is
+  // in use, so release its LittleFS buffer before the next HTTP request.
+  if (!DisplayManager.showGif)
+  {
+    ui->closeGifFiles();
+  }
+#endif
 }
 
 void checkLifetime(uint8_t pos)
@@ -1343,6 +1478,16 @@ bool universe2_complete = false;
 
 void DisplayManager_::tick()
 {
+  // setApps() can be reached from the synchronous HTTP server.  Publishing
+  // MQTT there can block its TCP write and prevent the HTTP response.  Send
+  // the notification only after ServerManager::tick() has returned.
+  if (appLoopPending)
+  {
+    appLoopPending = false;
+    logC3CustomAdmission("sendapploop_begin");
+    sendAppLoop();
+    logC3CustomAdmission("sendapploop_complete");
+  }
   if (GAME_ACTIVE)
   {
     GameManager.tick();
@@ -1758,7 +1903,7 @@ void DisplayManager_::updateAppVector(const char *json)
   // Set the updated apps vector in the UI and save settings
   ui->setApps(Apps);
   saveSettings();
-  sendAppLoop();
+  queueAppLoop();
   setAutoTransition(AUTO_TRANSITION);
   doc.clear();
 }
@@ -2188,6 +2333,12 @@ void DisplayManager_::sendAppLoop()
   logC3Heap("app_loop_after_publish");
 }
 
+void DisplayManager_::queueAppLoop()
+{
+  appLoopPending = true;
+  logC3CustomAdmission("sendapploop_queued");
+}
+
 String CRGBtoHex(CRGB color)
 {
   char buf[8];
@@ -2469,9 +2620,12 @@ void DisplayManager_::setCustomAppColors(uint32_t color)
   }
 }
 
-String DisplayManager_::ledsAsJson()
+size_t DisplayManager_::ledsAsJson(char *buffer, size_t bufferSize)
 {
-  StaticJsonDocument<JSON_ARRAY_SIZE(MATRIX_WIDTH * MATRIX_HEIGHT)> jsonDoc;
+  // LiveView calls this frequently. Keep both the document and response storage
+  // out of the heap so repeated screen snapshots cannot fragment the ESP32-C3.
+  static StaticJsonDocument<JSON_ARRAY_SIZE(MATRIX_WIDTH * MATRIX_HEIGHT)> jsonDoc;
+  jsonDoc.clear();
   JsonArray jsonColors = jsonDoc.to<JsonArray>();
   for (int y = 0; y < MATRIX_HEIGHT; y++)
   {
@@ -2482,9 +2636,15 @@ String DisplayManager_::ledsAsJson()
       jsonColors.add(color);
     }
   }
-  String jsonString;
-  serializeJson(jsonColors, jsonString);
-  return jsonString;
+  return serializeJson(jsonColors, buffer, bufferSize);
+}
+
+String DisplayManager_::ledsAsJson()
+{
+  constexpr size_t screenJsonBufferSize = MATRIX_WIDTH * MATRIX_HEIGHT * 9 + 2;
+  char buffer[screenJsonBufferSize];
+  const size_t length = ledsAsJson(buffer, sizeof(buffer));
+  return length ? String(buffer) : String();
 }
 
 String DisplayManager_::getAppsWithIcon()
@@ -2583,11 +2743,11 @@ void DisplayManager_::processDrawInstructions(int16_t xOffset, int16_t yOffset, 
     for (auto kvp : instruction)
     {
       logC3Heap("draw_command_before");
-      String command = kvp.key().c_str();
+      const char *command = kvp.key().c_str();
       logC3Heap("draw_command_after");
 
       JsonArray params = kvp.value().as<JsonArray>();
-      if (command == "dp")
+      if (strcmp(command, "dp") == 0)
       {
         logC3Heap("draw_dp");
         int x = params[0].as<int>();
@@ -2596,7 +2756,7 @@ void DisplayManager_::processDrawInstructions(int16_t xOffset, int16_t yOffset, 
         uint32_t color = getColorFromJsonVariant(color1, TEXTCOLOR_888);
         matrix->drawPixel(x + xOffset, y + yOffset, color);
       }
-      else if (command == "dl")
+      else if (strcmp(command, "dl") == 0)
       {
         logC3Heap("draw_dl");
         int x0 = params[0].as<int>();
@@ -2607,7 +2767,7 @@ void DisplayManager_::processDrawInstructions(int16_t xOffset, int16_t yOffset, 
         uint32_t color = getColorFromJsonVariant(color2, TEXTCOLOR_888);
         drawLine(x0 + xOffset, y0 + yOffset, x1 + xOffset, y1 + yOffset, color);
       }
-      else if (command == "dr")
+      else if (strcmp(command, "dr") == 0)
       {
         int x = params[0].as<int>();
         int y = params[1].as<int>();
@@ -2617,7 +2777,7 @@ void DisplayManager_::processDrawInstructions(int16_t xOffset, int16_t yOffset, 
         uint32_t color = getColorFromJsonVariant(color3, TEXTCOLOR_888);
         drawRect(x + xOffset, y + yOffset, w, h, color);
       }
-      else if (command == "df")
+      else if (strcmp(command, "df") == 0)
       {
         int x = params[0].as<int>();
         int y = params[1].as<int>();
@@ -2627,7 +2787,7 @@ void DisplayManager_::processDrawInstructions(int16_t xOffset, int16_t yOffset, 
         uint32_t color = getColorFromJsonVariant(color4, TEXTCOLOR_888);
         drawFilledRect(x + xOffset, y + yOffset, w, h, color);
       }
-      else if (command == "dc")
+      else if (strcmp(command, "dc") == 0)
       {
         int x = params[0].as<int>();
         int y = params[1].as<int>();
@@ -2636,7 +2796,7 @@ void DisplayManager_::processDrawInstructions(int16_t xOffset, int16_t yOffset, 
         uint32_t color = getColorFromJsonVariant(color5, TEXTCOLOR_888);
         drawCircle(x + xOffset, y + yOffset, r, color);
       }
-      else if (command == "dfc")
+      else if (strcmp(command, "dfc") == 0)
       {
         double x = params[0].as<double>();
         double y = params[1].as<double>();
@@ -2645,7 +2805,7 @@ void DisplayManager_::processDrawInstructions(int16_t xOffset, int16_t yOffset, 
         uint32_t color = getColorFromJsonVariant(color6, TEXTCOLOR_888);
         fillCircle(x + xOffset, y + yOffset, r, color);
       }
-      else if (command == "dt")
+      else if (strcmp(command, "dt") == 0)
       {
         logC3Heap("draw_dt_before");
         int x = params[0].as<int>();
@@ -2660,26 +2820,26 @@ void DisplayManager_::processDrawInstructions(int16_t xOffset, int16_t yOffset, 
         matrixPrint(utf8ascii(text).c_str());
         logC3Heap("draw_dt_after");
       }
-      else if (command == "db")
+      else if (strcmp(command, "db") == 0)
       {
         int x = params[0].as<int>();
         int y = params[1].as<int>();
         int width = params[2].as<int>();
         int height = params[3].as<int>();
-        std::vector<uint32_t> bitmap(width * height);
         JsonArray colorArray = params[4].as<JsonArray>();
-        size_t i = 0;
-        for (const auto &color : colorArray)
+        const size_t pixelCount = static_cast<size_t>(width) * static_cast<size_t>(height);
+        if (width <= 0 || height <= 0 || width > 32 || height > 8 || colorArray.size() < pixelCount)
         {
-          bitmap[i] = color.as<uint32_t>();
-          i++;
+          DEBUG_PRINTF("Draw bitmap rejected: %dx%d with %u colors", width, height, colorArray.size());
+          continue;
         }
+
         size_t bitmapIndex = 0;
         for (int row = 0; row < height; ++row)
         {
           for (int col = 0; col < width; ++col)
           {
-            matrix->drawPixel(x + col + xOffset, y + row + yOffset, bitmap[bitmapIndex++]);
+            matrix->drawPixel(x + col + xOffset, y + row + yOffset, colorArray[bitmapIndex++].as<uint32_t>());
           }
         }
       }

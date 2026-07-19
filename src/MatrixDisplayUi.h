@@ -141,6 +141,7 @@ public:
    * Initialise the display
    */
   void init();
+  void closeGifFilesExcept(GifPlayer *activePlayer);
 
   uint8_t getnextAppNumber();
   /**
@@ -202,6 +203,9 @@ public:
    * Add app drawing functions
    */
   void setApps(const std::vector<std::pair<String, AppCallback>> &appPairs);
+
+  // Releases LittleFS file buffers retained by the two GIF transition renderers.
+  void closeGifFiles();
 
   // Overlay
   void forceResetState();

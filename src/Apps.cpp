@@ -467,27 +467,39 @@ void ShowCustomApp(String name, FastLED_NeoMatrix *matrix, MatrixDisplayUiState 
     CURRENT_APP = ca->name;
     currentCustomApp = name;
 
-    if ((ca->iconName.length() > 0) && !ca->icon)
+    if ((ca->iconName.length() > 0) && !ca->icon && !ca->isGif)
     {
         DisplayManager.logC3Heap("icon_open_before");
-        const char *extensions[] = {".jpg", ".gif"};
-        bool isGifFlags[] = {false, true};
-
-        for (int i = 0; i < 2; i++)
+        char filePath[80];
+        snprintf(filePath, sizeof(filePath), "/ICONS/%s.jpg", ca->iconName.c_str());
+        if (LittleFS.exists(filePath))
         {
-            String filePath = "/ICONS/" + ca->iconName + extensions[i];
+            ca->icon = LittleFS.open(filePath);
+            ca->currentFrame = 0;
+        }
+        else
+        {
+            snprintf(filePath, sizeof(filePath), "/ICONS/%s.gif", ca->iconName.c_str());
             if (LittleFS.exists(filePath))
             {
-                ca->isGif = isGifFlags[i];
-                ca->icon = LittleFS.open(filePath);
+                // GifPlayer owns the only File instance for named GIF pages.
+                // Keeping another one in CustomApp fragments the C3 heap.
+                ca->isGif = true;
                 ca->currentFrame = 0;
-                break;
             }
         }
         DisplayManager.logC3Heap("icon_open_after");
     }
 
-    bool hasIcon = ca->icon || ca->jpegDataSize > 0;
+#ifdef ESP32_C3
+    // Avoid opening a second decoder during transitions, but render named
+    // GIFs normally on the fixed page. HTTP briefly pauses decoding after a
+    // request so lwIP can release the preceding request buffers.
+    const bool c3GifCanRender = state->appState != IN_TRANSITION && !DisplayManager.isGifPausedForHttp();
+    DisplayManager.showGif = ca->isGif && c3GifCanRender;
+#endif
+
+    bool hasIcon = ca->isGif || ca->icon || ca->jpegDataSize > 0;
 
     uint16_t textWidth = 0;
     if (!ca->fragments.empty())
@@ -500,7 +512,7 @@ void ShowCustomApp(String name, FastLED_NeoMatrix *matrix, MatrixDisplayUiState 
             textWidth += getTextWidth(replacedFragment.c_str(), ca->textCase);
         }
     }
-    else
+    else if (ca->text.length() > 0)
     {
         DisplayManager.logC3Heap("custom_width_string_before");
         String replacedText = replacePlaceholders(ca->text);
@@ -535,10 +547,26 @@ void ShowCustomApp(String name, FastLED_NeoMatrix *matrix, MatrixDisplayUiState 
             }
             if (ca->isGif)
             {
+#ifdef ESP32_C3
+                // Do not open a second GIF decoder just to render a
+                // transition frame, or while HTTP is releasing TCP buffers.
+                if (state->appState == IN_TRANSITION || DisplayManager.isGifPausedForHttp())
+                {
+                    iconWidth = 8;
+                }
+                else
+#endif
+                {
                 DisplayManager.logC3Heap("gif_decode_before");
-                iconWidth = gifPlayer->playGif(x + ca->iconPosition + ca->iconOffset, y, &ca->icon, ca->currentFrame);
+                char gifPath[80];
+                snprintf(gifPath, sizeof(gifPath), "/ICONS/%s.gif", ca->iconName.c_str());
+#ifdef ESP32_C3
+                DisplayManager.closeInactiveGifFiles(gifPlayer);
+#endif
+                iconWidth = gifPlayer->playGif(x + ca->iconPosition + ca->iconOffset, y, gifPath, ca->currentFrame);
                 ca->currentFrame = gifPlayer->getFrame();
                 DisplayManager.logC3Heap("gif_decode_after");
+                }
             }
             else
             {
@@ -674,9 +702,18 @@ void ShowCustomApp(String name, FastLED_NeoMatrix *matrix, MatrixDisplayUiState 
         textX = hasIcon ? 9 : 0;
     }
 
-    DisplayManager.logC3Heap("custom_text_string_before");
-    String text = replacePlaceholders(ca->text);
-    DisplayManager.logC3Heap("custom_text_string_after");
+    // Static custom-page text is already stored in the app. Only allocate a
+    // replacement String when the page actually contains an MQTT placeholder.
+    const String *renderText = &ca->text;
+    String replacedText;
+    if (ca->text.indexOf("{{") >= 0)
+    {
+        DisplayManager.logC3Heap("custom_text_string_before");
+        replacedText = replacePlaceholders(ca->text);
+        DisplayManager.logC3Heap("custom_text_string_after");
+        renderText = &replacedText;
+    }
+    const char *text = renderText->c_str();
     DisplayManager.logC3Heap("custom_text_before");
 
     if (noScrolling)
@@ -696,19 +733,18 @@ void ShowCustomApp(String name, FastLED_NeoMatrix *matrix, MatrixDisplayUiState 
         }
         else
         {
-            String text = replacePlaceholders(ca->text);
             if (ca->rainbow)
             {
-                DisplayManager.HSVtext(x + textX + ca->textOffset, 6 + y, text.c_str(), false, ca->textCase);
+                DisplayManager.HSVtext(x + textX + ca->textOffset, 6 + y, text, false, ca->textCase);
             }
             else if (ca->gradient[0] > -1 && ca->gradient[1] > -1)
             {
-                DisplayManager.GradientText(x + textX + ca->textOffset, 6 + y, text.c_str(), ca->gradient[0], ca->gradient[1], false, ca->textCase);
+                DisplayManager.GradientText(x + textX + ca->textOffset, 6 + y, text, ca->gradient[0], ca->gradient[1], false, ca->textCase);
             }
             else
             {
                 DisplayManager.setTextColor(TextEffect(ca->color, ca->fade, ca->blink));
-                DisplayManager.printText(x + textX + ca->textOffset, y + 6, text.c_str(), false, ca->textCase);
+                DisplayManager.printText(x + textX + ca->textOffset, y + 6, text, false, ca->textCase);
             }
         }
     }
@@ -729,16 +765,16 @@ void ShowCustomApp(String name, FastLED_NeoMatrix *matrix, MatrixDisplayUiState 
         {
             if (ca->rainbow)
             {
-                DisplayManager.HSVtext(x + ca->scrollposition + ca->textOffset, 6 + y, text.c_str(), false, ca->textCase);
+                DisplayManager.HSVtext(x + ca->scrollposition + ca->textOffset, 6 + y, text, false, ca->textCase);
             }
             else if (ca->gradient[0] > -1 && ca->gradient[1] > -1)
             {
-                DisplayManager.GradientText(x + ca->scrollposition + ca->textOffset, 6 + y, text.c_str(), ca->gradient[0], ca->gradient[1], false, ca->textCase);
+                DisplayManager.GradientText(x + ca->scrollposition + ca->textOffset, 6 + y, text, ca->gradient[0], ca->gradient[1], false, ca->textCase);
             }
             else
             {
                 DisplayManager.setTextColor(TextEffect(ca->color, ca->fade, ca->blink));
-                DisplayManager.printText(x + ca->scrollposition + ca->textOffset, 6 + y, text.c_str(), false, ca->textCase);
+                DisplayManager.printText(x + ca->scrollposition + ca->textOffset, 6 + y, text, false, ca->textCase);
             }
         }
     }

@@ -317,6 +317,7 @@ private:
     DNSServer m_dnsServer;
     fs::FS *m_filesystem;
     File m_uploadFile;
+    String m_uploadPath;
     bool m_fsOK = false;
     bool m_apmode = false;
     char *m_apWebpage = (char *)"/setup";

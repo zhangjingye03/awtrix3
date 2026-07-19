@@ -15,6 +15,7 @@
 #include <HTTPClient.h>
 #include "Games/GameManager.h"
 #include <EEPROM.h>
+#include <mbedtls/base64.h>
 
 WiFiUDP udp;
 
@@ -28,7 +29,157 @@ int bufferIndex = 0;
 
 // Aktueller verbundener Client
 WiFiClient currentClient = WiFiClient();
+#ifdef ESP32_C3
+class C3WebServer : public WebServer
+{
+public:
+    using WebServer::WebServer;
+
+    ~C3WebServer() override
+    {
+        free(_heapReserve);
+    }
+
+    void handleClient() override
+    {
+        if (_currentStatus == HC_NONE)
+        {
+            // An animated GIF keeps a LittleFS read buffer alive. Do not
+            // reserve a second heap block while it is rendering; the RX
+            // reserve can be recreated after the GIF page becomes inactive.
+            if (DisplayManager.showGif && _heapReserve != nullptr)
+            {
+                free(_heapReserve);
+                _heapReserve = nullptr;
+                _reserveDeferred = true;
+#ifdef ESP32_C3
+                Serial.printf("[%lu] [C3HTTP] reserve released for active GIF free=%u largest=%u\n",
+                              millis(), ESP.getFreeHeap(), ESP.getMaxAllocHeap());
+#endif
+            }
+            _currentClient = _server.available();
+            if (!_currentClient)
+            {
+                restoreHeapReserve();
+                if (_nullDelay)
+                    delay(1);
+                return;
+            }
+
+            // WiFiClient allocates its 1436-byte RX buffer lazily while
+            // parsing the request. Keep this contiguous emergency block out
+            // of the fragmented GIF heap, then release it before parsing.
+            // This avoids an active named GIF making every HTTP endpoint
+            // unavailable solely because WiFiClient::fillBuffer() cannot
+            // allocate its fixed RX buffer.
+#ifdef ESP32_C3
+            Serial.printf("[%lu] [C3HTTP] client accepted free=%u largest=%u reserve=%u\n",
+                          millis(), ESP.getFreeHeap(), ESP.getMaxAllocHeap(),
+                          _heapReserve == nullptr ? 0 : HeapReserveSize);
+#endif
+            DisplayManager.prepareForHttpRequest();
+            free(_heapReserve);
+            _heapReserve = nullptr;
+#ifdef ESP32_C3
+            Serial.printf("[%lu] [C3HTTP] reserve released free=%u largest=%u\n",
+                          millis(), ESP.getFreeHeap(), ESP.getMaxAllocHeap());
+#endif
+            _currentStatus = HC_WAIT_READ;
+            _statusChange = millis();
+        }
+
+        bool keepCurrentClient = false;
+        bool callYield = false;
+        if (_currentClient.connected())
+        {
+            if (_currentStatus == HC_WAIT_READ)
+            {
+                if (_currentClient.available())
+                {
+                    if (_parseRequest(_currentClient))
+                    {
+                        _currentClient.setTimeout(HTTP_MAX_SEND_WAIT / 1000);
+                        _contentLength = CONTENT_LENGTH_NOT_SET;
+                        _handleRequest();
+                    }
+                }
+                // A C3 has only one synchronous WebServer client. Do not
+                // hold it for the framework's multi-second read timeout:
+                // rapid curl/browser polling can otherwise leave a stale
+                // half-open client blocking every following request.
+                else if (millis() - _statusChange <= 250)
+                {
+                    keepCurrentClient = true;
+                    callYield = true;
+                }
+            }
+        }
+
+        if (!keepCurrentClient)
+        {
+            // Arduino-ESP32 2.0.x only releases the WiFiClient wrapper here.
+            // Explicitly stop first so lwIP releases the per-request pbufs on
+            // the C3 instead of retaining them until the peer's close timer.
+            _currentClient.stop();
+            _currentClient = WiFiClient();
+            _currentStatus = HC_NONE;
+            _currentUpload.reset();
+            _currentRaw.reset();
+            restoreHeapReserve();
+        }
+
+        if (callYield)
+            yield();
+    }
+
+private:
+    // WiFiClient allocates a 1436-byte RX buffer lazily. Keep only that
+    // allocation available for the next request. A larger reserve looked
+    // safer, but after a response lwIP still owns several KB of pbuf/socket
+    // state; reclaiming 4 KB at that point fragmented the C3 heap enough to
+    // prevent the next request from being received.
+    static constexpr size_t HeapReserveSize = 1536;
+    static constexpr size_t HeapReserveRestoreMinBlock = 4096;
+    uint8_t *_heapReserve = nullptr;
+    bool _reserveDeferred = false;
+
+    void restoreHeapReserve()
+    {
+        if (_heapReserve == nullptr)
+        {
+            const uint32_t freeBefore = ESP.getFreeHeap();
+            const uint32_t largestBefore = ESP.getMaxAllocHeap();
+            // Do not split the last useful TCP/GIF block in two. The reserve
+            // is a recovery aid, not a requirement: with it released the
+            // existing largest block is still available to WiFiClient.
+            if (DisplayManager.showGif || largestBefore < HeapReserveRestoreMinBlock)
+            {
+#ifdef ESP32_C3
+                if (!_reserveDeferred)
+                {
+                    Serial.printf("[%lu] [C3HTTP] reserve deferred free=%u largest=%u\n",
+                                  millis(), freeBefore, largestBefore);
+                }
+#endif
+                _reserveDeferred = true;
+                return;
+            }
+            _heapReserve = static_cast<uint8_t *>(malloc(HeapReserveSize));
+            _reserveDeferred = false;
+#ifdef ESP32_C3
+            Serial.printf("[%lu] [C3HTTP] reserve %s free=%u largest=%u (before free=%u largest=%u)\n",
+                          millis(), _heapReserve == nullptr ? "failed" : "restored",
+                          ESP.getFreeHeap(), ESP.getMaxAllocHeap(), freeBefore, largestBefore);
+#endif
+        }
+    }
+};
+// The normal framework lifecycle handles queued clients correctly now that
+// GIF files use a bounded VFS buffer on the ESP32-C3.
 WebServer server(80);
+#else
+WebServer server(80);
+#endif
 FSWebServer mws(LittleFS, server);
 
 // Erstelle eine Server-Instanz
@@ -38,6 +189,131 @@ static bool webOtaSucceeded = false;
 static bool webOtaStarted = false;
 static size_t webOtaBytesWritten = 0;
 static String webOtaError;
+
+#ifdef ESP32_C3
+static String c3IconUploadName;
+static size_t c3IconUploadSize = 0;
+
+static bool isValidC3IconName(const char *name)
+{
+    if (name == nullptr)
+        return false;
+
+    const String filename(name);
+    if (filename.length() == 0 || filename.length() > 48 || filename.indexOf('/') >= 0 || filename.indexOf('\\') >= 0 || filename.indexOf("..") >= 0)
+        return false;
+
+    const String extension = filename.substring(filename.lastIndexOf('.') + 1);
+    return extension.equalsIgnoreCase("gif") || extension.equalsIgnoreCase("jpg") || extension.equalsIgnoreCase("jpeg");
+}
+
+static void handleC3IconUpload()
+{
+    WebServerClass *request = mws.getRequest();
+    StaticJsonDocument<1536> payload;
+    const DeserializationError parseError = deserializeJson(payload, request->arg("plain"));
+    const char *name = payload["name"].as<const char *>();
+    const char *encoded = payload["data"].as<const char *>();
+    const bool start = payload["start"] | false;
+    const bool finalChunk = payload["final"] | false;
+
+    if (parseError || !isValidC3IconName(name) || encoded == nullptr)
+    {
+        DEBUG_PRINTF("[C3HTTP] rejected icon chunk: json=%s name=%s data=%u",
+                     parseError.c_str(), name == nullptr ? "<null>" : name,
+                     encoded == nullptr ? 0 : static_cast<unsigned int>(strlen(encoded)));
+        request->send(400, F("text/plain"), F("Invalid icon upload chunk"));
+        return;
+    }
+
+    constexpr size_t maxChunkSize = 384;
+    constexpr size_t maxIconSize = 32 * 1024;
+    const size_t encodedLength = strlen(encoded);
+    if (encodedLength == 0 || encodedLength > 4 * ((maxChunkSize + 2) / 3))
+    {
+        request->send(400, F("text/plain"), F("Invalid icon chunk size"));
+        return;
+    }
+
+    if (start)
+    {
+        c3IconUploadName = name;
+        c3IconUploadSize = 0;
+    }
+    else if (c3IconUploadName != name)
+    {
+        request->send(409, F("text/plain"), F("Icon upload must start with the first chunk"));
+        return;
+    }
+
+    uint8_t decoded[maxChunkSize];
+    size_t writtenLength = 0;
+    if (mbedtls_base64_decode(decoded, sizeof(decoded), &writtenLength,
+                              reinterpret_cast<const unsigned char *>(encoded), encodedLength) != 0 ||
+        writtenLength == 0 || writtenLength > maxChunkSize)
+    {
+        request->send(400, F("text/plain"), F("Invalid base64 icon chunk"));
+        return;
+    }
+
+    if (c3IconUploadSize + writtenLength > maxIconSize)
+    {
+        LittleFS.remove(String("/ICONS/") + c3IconUploadName);
+        c3IconUploadName = String();
+        c3IconUploadSize = 0;
+        request->send(413, F("text/plain"), F("Icon exceeds 32 KB limit"));
+        return;
+    }
+
+    const String path = String("/ICONS/") + c3IconUploadName;
+    File file = LittleFS.open(path, start ? "w" : "a");
+    if (!file || file.write(decoded, writtenLength) != writtenLength)
+    {
+        if (file)
+            file.close();
+        request->send(500, F("text/plain"), F("Icon write failed"));
+        return;
+    }
+    file.close();
+    c3IconUploadSize += writtenLength;
+
+    char response[64];
+    snprintf(response, sizeof(response), "{\"ok\":true,\"size\":%u}", static_cast<unsigned int>(c3IconUploadSize));
+    request->send(200, F("application/json"), response);
+
+    if (finalChunk)
+    {
+        DEBUG_PRINTF("[C3HTTP] icon upload complete: %s (%u bytes)", c3IconUploadName.c_str(), static_cast<unsigned int>(c3IconUploadSize));
+        c3IconUploadName = String();
+        c3IconUploadSize = 0;
+    }
+}
+
+static void logC3WiFiEvent(WiFiEvent_t event, WiFiEventInfo_t info)
+{
+    if (event == ARDUINO_EVENT_WIFI_STA_DISCONNECTED)
+    {
+        DEBUG_PRINTF("[C3WIFI] disconnected reason=%u free=%u largest=%u min=%u",
+                     info.wifi_sta_disconnected.reason,
+                     ESP.getFreeHeap(),
+                     heap_caps_get_largest_free_block(MALLOC_CAP_8BIT),
+                     ESP.getMinFreeHeap());
+    }
+    else if (event == ARDUINO_EVENT_WIFI_STA_GOT_IP)
+    {
+        DEBUG_PRINTF("[C3WIFI] got IP %s free=%u largest=%u",
+                     WiFi.localIP().toString().c_str(),
+                     ESP.getFreeHeap(),
+                     heap_caps_get_largest_free_block(MALLOC_CAP_8BIT));
+    }
+    else if (event == ARDUINO_EVENT_WIFI_STA_LOST_IP)
+    {
+        DEBUG_PRINTF("[C3WIFI] lost IP free=%u largest=%u",
+                     ESP.getFreeHeap(),
+                     heap_caps_get_largest_free_block(MALLOC_CAP_8BIT));
+    }
+}
+#endif
 
 static bool finalizeWebOta()
 {
@@ -61,6 +337,67 @@ static void sendJsonString(WebServerClass *webserver, const String &json)
 {
     webserver->send(200, F("application/json"), json);
 }
+
+#ifdef ESP32_C3
+static void handleC3MqttConfig()
+{
+    WebServerClass *request = mws.getRequest();
+
+    if (request->method() == HTTP_GET)
+    {
+        StaticJsonDocument<512> response;
+        response["host"] = MQTT_HOST;
+        response["port"] = MQTT_PORT;
+        response["user"] = MQTT_USER;
+        response["prefix"] = MQTT_PREFIX;
+        response["discovery"] = HA_DISCOVERY;
+        char payload[512];
+        serializeJson(response, payload, sizeof(payload));
+        request->send(200, F("application/json"), payload);
+        return;
+    }
+
+    StaticJsonDocument<512> update;
+    const DeserializationError parseError = deserializeJson(update, request->arg("plain"));
+    if (parseError || !update["host"].is<const char *>())
+    {
+        request->send(400, F("text/plain"), F("Invalid MQTT configuration"));
+        return;
+    }
+
+    File file = LittleFS.open("/DoNotTouch.json", "r");
+    StaticJsonDocument<1536> config;
+    if (file)
+    {
+        const DeserializationError configError = deserializeJson(config, file);
+        file.close();
+        if (configError)
+        {
+            request->send(500, F("text/plain"), F("Cannot read configuration"));
+            return;
+        }
+    }
+
+    config["Broker"] = update["host"].as<const char *>();
+    config["Port"] = update["port"] | 1883;
+    config["Username"] = update["user"] | "";
+    if (update.containsKey("pass"))
+        config["Password"] = update["pass"] | "";
+    config["Prefix"] = update["prefix"] | "";
+    config["Homeassistant Discovery"] = update["discovery"] | false;
+
+    file = LittleFS.open("/DoNotTouch.json", "w");
+    if (!file || serializeJson(config, file) == 0)
+    {
+        if (file)
+            file.close();
+        request->send(500, F("text/plain"), F("Cannot save configuration"));
+        return;
+    }
+    file.close();
+    request->send(200, F("text/plain"), F("OK"));
+}
+#endif
 
 void setupWebOtaHandler()
 {
@@ -179,6 +516,11 @@ void saveHandler()
 
 void addHandler()
 {
+#ifdef ESP32_C3
+    mws.addHandler("/api/c3/mqtt", HTTP_GET, handleC3MqttConfig);
+    mws.addHandler("/api/c3/mqtt", HTTP_POST, handleC3MqttConfig);
+    mws.addHandler("/api/c3/icon", HTTP_POST, handleC3IconUpload);
+#endif
 
     mws.addHandler("/api/power", HTTP_POST, []()
                    { DisplayManager.powerStateParse(mws.webserver->arg("plain").c_str()); mws.webserver->send(200,F("text/plain"),F("OK")); });
@@ -229,14 +571,23 @@ void addHandler()
                    {
     String fps = mws.webserver->arg("fps");
     if (fps == "") {
-        fps = "30"; 
+#ifdef ESP32_C3
+        fps = "5";
+#else
+        fps = "30";
+#endif
     }
+#ifdef ESP32_C3
+    // Keep framebuffer polling within the capacity of the synchronous C3 server.
+    fps = String(constrain(fps.toInt(), 1, 10));
+#endif
     String finalHTML = screenfull_html; 
     finalHTML.replace("%%FPS%%", fps);
 
+    mws.webserver->sendHeader("Cache-Control", "no-store");
     mws.webserver->send(200, "text/html", finalHTML.c_str()); });
     mws.addHandler("/screen", HTTP_GET, []()
-                   { mws.webserver->send(200, "text/html", screen_html); });
+                   { mws.webserver->sendHeader("Cache-Control", "no-store"); mws.webserver->send(200, "text/html", screen_html); });
     mws.addHandler("/backup", HTTP_GET, []()
                    { mws.webserver->send(200, "text/html", backup_html); });
     mws.addHandler("/api/previousapp", HTTP_POST, []()
@@ -271,24 +622,64 @@ void addHandler()
     mws.addHandler("/api/custom", HTTP_POST, []()
                    {
                     DisplayManager.logC3Heap("http_custom_entry");
+                    DisplayManager.logC3CustomAdmission("http_handler_entry");
                     String name = mws.webserver->arg("name");
                     String payload = mws.webserver->arg("plain");
                     DisplayManager.logC3Heap("http_custom_copied");
+                    DisplayManager.logC3CustomAdmission("http_body_copied");
                     if (DisplayManager.parseCustomPage(name, payload.c_str(), false)){
                         DisplayManager.logC3Heap("http_custom_parsed");
+                        DisplayManager.logC3CustomAdmission("http_parse_complete");
+                        DisplayManager.logC3CustomAdmission("http_response_send");
                         mws.webserver->send(200,F("text/plain"),F("OK"));
+                        DisplayManager.logC3CustomAdmission("http_response_complete");
+#ifdef ESP32_C3
+                        Serial.printf("[%lu] [C3GIF] http custom complete name=%s remove=%u\n",
+                                      millis(), name.c_str(), payload == "{}" || payload.length() == 0);
+#endif
                     }else{
+                        DisplayManager.logC3CustomAdmission("http_parse_rejected");
                         mws.webserver->send(500,F("text/plain"),F("ErrorParsingJson"));
                     }
                     DisplayManager.logC3Heap("http_custom_complete"); });
     mws.addHandler("/api/stats", HTTP_GET, []()
                    {
                     char statsBuffer[512];
-                    DisplayManager.getStats(statsBuffer, sizeof(statsBuffer));
+                    const size_t length = DisplayManager.getStats(statsBuffer, sizeof(statsBuffer));
+#ifdef ESP32_C3
+                    // WebServer::send(const char*) builds temporary String
+                    // header/content objects. Repeated stats polling then
+                    // fragments the C3 heap. Send this fixed-size API reply
+                    // directly from the caller-owned buffer instead.
+                    char header[160];
+                    const int headerLength = snprintf(header, sizeof(header),
+                                                      "HTTP/1.1 200 OK\r\n"
+                                                      "Content-Type: application/json\r\n"
+                                                      "Content-Length: %u\r\n"
+                                                      "Access-Control-Allow-Origin: *\r\n"
+                                                      "Connection: close\r\n\r\n",
+                                                      static_cast<unsigned int>(length));
+                    WiFiClient client = mws.webserver->client();
+                    if (headerLength > 0 && static_cast<size_t>(headerLength) < sizeof(header))
+                    {
+                        client.write(reinterpret_cast<const uint8_t *>(header), headerLength);
+                        client.write(reinterpret_cast<const uint8_t *>(statsBuffer), length);
+                    }
+#else
                     mws.webserver->send(200, F("application/json"), statsBuffer);
+#endif
                    });
     mws.addHandler("/api/screen", HTTP_GET, []()
-                   { String json = DisplayManager.ledsAsJson(); sendJsonString(mws.webserver, json); });
+                   {
+                    static char screenBuffer[32 * 8 * 9 + 2];
+                    const size_t length = DisplayManager.ledsAsJson(screenBuffer, sizeof(screenBuffer));
+                    if (length == 0)
+                    {
+                     mws.webserver->send(500, F("text/plain"), F("ScreenSerializationFailed"));
+                     return;
+                    }
+                    mws.webserver->send(200, F("application/json"), screenBuffer);
+                   });
     mws.addHandler("/api/indicator1", HTTP_POST, []()
                    { 
                     if (DisplayManager.indicatorParser(1,mws.webserver->arg("plain").c_str())){
@@ -324,6 +715,9 @@ void addHandler()
 
 void ServerManager_::setup()
 {
+#ifdef ESP32_C3
+    WiFi.onEvent(logC3WiFiEvent);
+#endif
     esp_wifi_set_max_tx_power(80); // 82 * 0.25 dBm = 20.5 dBm
     esp_wifi_set_ps(WIFI_PS_NONE); // Power Saving deaktivieren
     if (!local_IP.fromString(NET_IP) || !gateway.fromString(NET_GW) || !subnet.fromString(NET_SN) || !primaryDNS.fromString(NET_PDNS) || !secondaryDNS.fromString(NET_SDNS))
