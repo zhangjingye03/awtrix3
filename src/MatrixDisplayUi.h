@@ -101,6 +101,7 @@ private:
   bool setAutoTransition = true;
   bool lastFrameShown;
   AppCallback *AppFunctions = nullptr;
+  uint8_t appFunctionCapacity = 0;
 
   // Internally used to transition to a specific app
   int8_t nextAppNumber = -1;

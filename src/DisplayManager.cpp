@@ -418,10 +418,12 @@ void DisplayManager_::GradientText(int16_t x, int16_t y, const char *text, int c
     show();
 }
 
-void pushCustomApp(String name, int position)
+void pushCustomApp(const String &name, int position)
 {
   DisplayManager.logC3Heap("custom_vector_before");
-  if (customApps.count(name) == 0)
+  const auto existingApp = std::find_if(Apps.begin(), Apps.end(), [&name](const std::pair<String, AppCallback> &appPair)
+                                        { return appPair.first == name; });
+  if (existingApp == Apps.end())
   {
     int availableCallbackIndex = -1;
 
@@ -673,12 +675,12 @@ void subscribeToPlaceholders(String text)
 bool DisplayManager_::generateCustomPage(const String &name, JsonObject doc, bool preventSave)
 {
   logC3Heap("custom_generate_entry");
-  CustomApp customApp;
-
-  if (customApps.find(name) != customApps.end())
-  {
-    customApp = customApps[name];
-  }
+  const auto existingApp = customApps.find(name);
+  const bool needsUiRebuild = existingApp == customApps.end();
+  // Update resident pages in place. Copying a Weatherflow CustomApp copies
+  // its draw String and vectors, causing an avoidable C3 heap peak.
+  CustomApp pendingCustomApp;
+  CustomApp &customApp = needsUiRebuild ? pendingCustomApp : existingApp->second;
 
   customApp.progress = doc.containsKey("progress") ? doc["progress"].as<int>() : -1;
 
@@ -976,13 +978,16 @@ bool DisplayManager_::generateCustomPage(const String &name, JsonObject doc, boo
   customApp.lastUpdate = millis();
   customApp.lifeTimeEnd = false;
   doc.clear();
-  const bool needsUiRebuild = customApps.count(name) == 0;
   logC3CustomAdmission("insert_apps_begin");
   logC3Heap("custom_insert_before");
+  if (needsUiRebuild)
+  {
+    // Move the completed app into its map node before publishing it through
+    // the callback list, avoiding a second deep copy of its Strings/vectors.
+    customApps.emplace(name, std::move(pendingCustomApp));
+    logC3Heap("custom_map_emplaced");
+  }
   pushCustomApp(name, pos - 1);
-  logC3Heap("custom_map_assign_before");
-  customApps[name] = customApp;
-  logC3Heap("custom_map_assign_after");
   logC3CustomAdmission("insert_map_committed");
   if (needsUiRebuild)
   {
@@ -2810,14 +2815,14 @@ void DisplayManager_::processDrawInstructions(int16_t xOffset, int16_t yOffset, 
         logC3Heap("draw_dt_before");
         int x = params[0].as<int>();
         int y = params[1].as<int>();
-        logC3Heap("draw_dt_string_before");
-        String text = params[2].as<String>();
-        logC3Heap("draw_dt_string_after");
+        const char *drawText = params[2].as<const char *>();
+        char text[128];
+        utf8asciiToBuffer(drawText != nullptr ? drawText : "", text, sizeof(text));
         auto color7 = params[3];
         uint32_t color = getColorFromJsonVariant(color7, TEXTCOLOR_888);
         setTextColor(color);
         setCursor(x + xOffset, y + yOffset + 5);
-        matrixPrint(utf8ascii(text).c_str());
+        matrixPrint(text);
         logC3Heap("draw_dt_after");
       }
       else if (strcmp(command, "db") == 0)

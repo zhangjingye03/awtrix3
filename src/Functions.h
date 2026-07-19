@@ -23,6 +23,9 @@ byte utf8ascii(byte ascii);
 
 String utf8ascii(String s);
 
+// Converts UTF-8 text without allocating a temporary Arduino String.
+size_t utf8asciiToBuffer(const char *source, char *destination, size_t destinationSize);
+
 uint32_t TextEffect(uint32_t color, uint32_t fade, uint32_t blink);
 
 uint32_t fadeColor(uint32_t color, uint32_t interval);

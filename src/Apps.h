@@ -64,9 +64,9 @@ extern String currentCustomApp;
 extern std::map<String, CustomApp> customApps;
 extern void (*customAppCallbacks[20])(FastLED_NeoMatrix *, MatrixDisplayUiState *, int16_t, int16_t, GifPlayer *);
 
-CustomApp *getCustomAppByName(String name);
+CustomApp *getCustomAppByName(const String &name);
 
-String getAppNameByFunction(AppCallback AppFunction);
+const String *getAppNameByFunction(AppCallback AppFunction);
 
 String getAppNameAtIndex(int index);
 
@@ -86,7 +86,7 @@ void HumApp(FastLED_NeoMatrix *matrix, MatrixDisplayUiState *state, int16_t x, i
 void BatApp(FastLED_NeoMatrix *matrix, MatrixDisplayUiState *state, int16_t x, int16_t y, GifPlayer *gifPlayer);
 #endif
 
-void ShowCustomApp(String name, FastLED_NeoMatrix *matrix, MatrixDisplayUiState *state, int16_t x, int16_t y, GifPlayer *gifPlayer);
+void ShowCustomApp(const String &name, FastLED_NeoMatrix *matrix, MatrixDisplayUiState *state, int16_t x, int16_t y, GifPlayer *gifPlayer);
 
 // Unattractive to have a function for every customapp which does the same, but currently still no other option found TODO
 void CApp1(FastLED_NeoMatrix *matrix, MatrixDisplayUiState *state, int16_t x, int16_t y, GifPlayer *gifPlayer);

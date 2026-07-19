@@ -138,11 +138,23 @@ void MatrixDisplayUi::setApps(const std::vector<std::pair<String, AppCallback>> 
   {
     currentCallback = AppFunctions[this->state.currentApp];
   }
+  AppCount = appPairs.size();
+#ifdef ESP32_C3
+  // Custom page updates occur while rendering. Reusing a small fixed callback
+  // array avoids repeated alloc/free fragmentation on the C3.
+  if (AppFunctions == nullptr || appFunctionCapacity < AppCount)
+  {
+    delete[] AppFunctions;
+    appFunctionCapacity = std::max<uint8_t>(20, AppCount);
+    AppFunctions = new AppCallback[appFunctionCapacity];
+    DisplayManager.logC3Heap("ui_setapps_allocated");
+  }
+#else
   delete[] AppFunctions;
   DisplayManager.logC3Heap("ui_setapps_deleted");
-  AppCount = appPairs.size();
   AppFunctions = new AppCallback[AppCount];
   DisplayManager.logC3Heap("ui_setapps_allocated");
+#endif
   for (size_t i = 0; i < AppCount; ++i)
   {
     AppFunctions[i] = appPairs[i].second;

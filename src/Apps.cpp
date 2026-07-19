@@ -43,22 +43,23 @@ std::vector<std::pair<String, AppCallback>> Apps;
 String currentCustomApp;
 std::map<String, CustomApp> customApps;
 
-CustomApp *getCustomAppByName(String name)
+CustomApp *getCustomAppByName(const String &name)
 {
-    return customApps.count(name) ? &customApps[name] : nullptr;
+    const auto it = customApps.find(name);
+    return it != customApps.end() ? &it->second : nullptr;
 }
 
-String getAppNameByFunction(AppCallback AppFunction)
+const String *getAppNameByFunction(AppCallback AppFunction)
 {
     for (const auto &appPair : Apps)
     {
         if (appPair.second == AppFunction)
         {
-            return appPair.first;
+            return &appPair.first;
         }
     }
 
-    return "";
+    return nullptr;
 }
 
 String getAppNameAtIndex(int index)
@@ -432,7 +433,7 @@ String replacePlaceholders(String text)
     return text;
 }
 
-void ShowCustomApp(String name, FastLED_NeoMatrix *matrix, MatrixDisplayUiState *state, int16_t x, int16_t y, GifPlayer *gifPlayer)
+void ShowCustomApp(const String &name, FastLED_NeoMatrix *matrix, MatrixDisplayUiState *state, int16_t x, int16_t y, GifPlayer *gifPlayer)
 {
     // Abort if notifyFlag is set
     if (notifyFlag)
@@ -506,18 +507,28 @@ void ShowCustomApp(String name, FastLED_NeoMatrix *matrix, MatrixDisplayUiState 
     {
       for (const auto &fragment : ca->fragments)
       {
-        DisplayManager.logC3Heap("custom_width_string_before");
-        String replacedFragment = replacePlaceholders(fragment);
-        DisplayManager.logC3Heap("custom_width_string_after");
+        if (fragment.indexOf("{{") >= 0)
+        {
+            String replacedFragment = replacePlaceholders(fragment);
             textWidth += getTextWidth(replacedFragment.c_str(), ca->textCase);
         }
+        else
+        {
+            textWidth += getTextWidth(fragment.c_str(), ca->textCase);
+        }
+      }
     }
     else if (ca->text.length() > 0)
     {
-        DisplayManager.logC3Heap("custom_width_string_before");
-        String replacedText = replacePlaceholders(ca->text);
-        DisplayManager.logC3Heap("custom_width_string_after");
-        textWidth = getTextWidth(replacedText.c_str(), ca->textCase);
+        if (ca->text.indexOf("{{") >= 0)
+        {
+            String replacedText = replacePlaceholders(ca->text);
+            textWidth = getTextWidth(replacedText.c_str(), ca->textCase);
+        }
+        else
+        {
+            textWidth = getTextWidth(ca->text.c_str(), ca->textCase);
+        }
     }
 
     uint16_t availableWidth = (hasIcon) ? 24 : 32;
@@ -725,10 +736,16 @@ void ShowCustomApp(String name, FastLED_NeoMatrix *matrix, MatrixDisplayUiState 
             int16_t fragmentX = textX + ca->textOffset;
             for (size_t i = 0; i < ca->fragments.size(); ++i)
             {
-                String text = replacePlaceholders(ca->fragments[i]);
+                const String *text = &ca->fragments[i];
+                String replacedFragment;
+                if (text->indexOf("{{") >= 0)
+                {
+                    replacedFragment = replacePlaceholders(*text);
+                    text = &replacedFragment;
+                }
                 DisplayManager.setTextColor(TextEffect(ca->colors[i], ca->fade, ca->blink));
-                DisplayManager.printText(x + fragmentX, y + 6, text.c_str(), false, ca->textCase);
-                fragmentX += getTextWidth(text.c_str(), ca->textCase);
+                DisplayManager.printText(x + fragmentX, y + 6, text->c_str(), false, ca->textCase);
+                fragmentX += getTextWidth(text->c_str(), ca->textCase);
             }
         }
         else
@@ -755,10 +772,16 @@ void ShowCustomApp(String name, FastLED_NeoMatrix *matrix, MatrixDisplayUiState 
             int16_t fragmentX = ca->scrollposition + ca->textOffset;
             for (size_t i = 0; i < ca->fragments.size(); ++i)
             {
-                String text = replacePlaceholders(ca->fragments[i]);
+                const String *text = &ca->fragments[i];
+                String replacedFragment;
+                if (text->indexOf("{{") >= 0)
+                {
+                    replacedFragment = replacePlaceholders(*text);
+                    text = &replacedFragment;
+                }
                 DisplayManager.setTextColor(TextEffect(ca->colors[i], ca->fade, ca->blink));
-                DisplayManager.printText(x + fragmentX, y + 6, text.c_str(), false, ca->textCase);
-                fragmentX += getTextWidth(text.c_str(), ca->textCase);
+                DisplayManager.printText(x + fragmentX, y + 6, text->c_str(), false, ca->textCase);
+                fragmentX += getTextWidth(text->c_str(), ca->textCase);
             }
         }
         else
@@ -801,124 +824,111 @@ void ShowCustomApp(String name, FastLED_NeoMatrix *matrix, MatrixDisplayUiState 
 
 // Unattractive to have a function for every customapp wich does the same, but currently still no other option found TODO
 
+#define RENDER_CUSTOM_APP(callback)                              \
+    const String *name = getAppNameByFunction(callback);         \
+    if (name != nullptr)                                         \
+        ShowCustomApp(*name, matrix, state, x, y, gifPlayer)
+
 void CApp1(FastLED_NeoMatrix *matrix, MatrixDisplayUiState *state, int16_t x, int16_t y, GifPlayer *gifPlayer)
 {
-    String name = getAppNameByFunction(CApp1);
-    ShowCustomApp(name, matrix, state, x, y, gifPlayer);
+    RENDER_CUSTOM_APP(CApp1);
 }
 
 void CApp2(FastLED_NeoMatrix *matrix, MatrixDisplayUiState *state, int16_t x, int16_t y, GifPlayer *gifPlayer)
 {
-    String name = getAppNameByFunction(CApp2);
-    ShowCustomApp(name, matrix, state, x, y, gifPlayer);
+    RENDER_CUSTOM_APP(CApp2);
 }
 
 void CApp3(FastLED_NeoMatrix *matrix, MatrixDisplayUiState *state, int16_t x, int16_t y, GifPlayer *gifPlayer)
 {
-    String name = getAppNameByFunction(CApp3);
-    ShowCustomApp(name, matrix, state, x, y, gifPlayer);
+    RENDER_CUSTOM_APP(CApp3);
 }
 
 void CApp4(FastLED_NeoMatrix *matrix, MatrixDisplayUiState *state, int16_t x, int16_t y, GifPlayer *gifPlayer)
 {
-    String name = getAppNameByFunction(CApp4);
-    ShowCustomApp(name, matrix, state, x, y, gifPlayer);
+    RENDER_CUSTOM_APP(CApp4);
 }
 
 void CApp5(FastLED_NeoMatrix *matrix, MatrixDisplayUiState *state, int16_t x, int16_t y, GifPlayer *gifPlayer)
 {
-    String name = getAppNameByFunction(CApp5);
-    ShowCustomApp(name, matrix, state, x, y, gifPlayer);
+    RENDER_CUSTOM_APP(CApp5);
 }
 
 void CApp6(FastLED_NeoMatrix *matrix, MatrixDisplayUiState *state, int16_t x, int16_t y, GifPlayer *gifPlayer)
 {
-    String name = getAppNameByFunction(CApp6);
-    ShowCustomApp(name, matrix, state, x, y, gifPlayer);
+    RENDER_CUSTOM_APP(CApp6);
 }
 
 void CApp7(FastLED_NeoMatrix *matrix, MatrixDisplayUiState *state, int16_t x, int16_t y, GifPlayer *gifPlayer)
 {
-    String name = getAppNameByFunction(CApp7);
-    ShowCustomApp(name, matrix, state, x, y, gifPlayer);
+    RENDER_CUSTOM_APP(CApp7);
 }
 
 void CApp8(FastLED_NeoMatrix *matrix, MatrixDisplayUiState *state, int16_t x, int16_t y, GifPlayer *gifPlayer)
 {
-    String name = getAppNameByFunction(CApp8);
-    ShowCustomApp(name, matrix, state, x, y, gifPlayer);
+    RENDER_CUSTOM_APP(CApp8);
 }
 
 void CApp9(FastLED_NeoMatrix *matrix, MatrixDisplayUiState *state, int16_t x, int16_t y, GifPlayer *gifPlayer)
 {
-    String name = getAppNameByFunction(CApp9);
-    ShowCustomApp(name, matrix, state, x, y, gifPlayer);
+    RENDER_CUSTOM_APP(CApp9);
 }
 
 void CApp10(FastLED_NeoMatrix *matrix, MatrixDisplayUiState *state, int16_t x, int16_t y, GifPlayer *gifPlayer)
 {
-    String name = getAppNameByFunction(CApp10);
-    ShowCustomApp(name, matrix, state, x, y, gifPlayer);
+    RENDER_CUSTOM_APP(CApp10);
 }
 
 void CApp11(FastLED_NeoMatrix *matrix, MatrixDisplayUiState *state, int16_t x, int16_t y, GifPlayer *gifPlayer)
 {
-    String name = getAppNameByFunction(CApp11);
-    ShowCustomApp(name, matrix, state, x, y, gifPlayer);
+    RENDER_CUSTOM_APP(CApp11);
 }
 
 void CApp12(FastLED_NeoMatrix *matrix, MatrixDisplayUiState *state, int16_t x, int16_t y, GifPlayer *gifPlayer)
 {
-    String name = getAppNameByFunction(CApp12);
-    ShowCustomApp(name, matrix, state, x, y, gifPlayer);
+    RENDER_CUSTOM_APP(CApp12);
 }
 
 void CApp13(FastLED_NeoMatrix *matrix, MatrixDisplayUiState *state, int16_t x, int16_t y, GifPlayer *gifPlayer)
 {
-    String name = getAppNameByFunction(CApp13);
-    ShowCustomApp(name, matrix, state, x, y, gifPlayer);
+    RENDER_CUSTOM_APP(CApp13);
 }
 
 void CApp14(FastLED_NeoMatrix *matrix, MatrixDisplayUiState *state, int16_t x, int16_t y, GifPlayer *gifPlayer)
 {
-    String name = getAppNameByFunction(CApp14);
-    ShowCustomApp(name, matrix, state, x, y, gifPlayer);
+    RENDER_CUSTOM_APP(CApp14);
 }
 
 void CApp15(FastLED_NeoMatrix *matrix, MatrixDisplayUiState *state, int16_t x, int16_t y, GifPlayer *gifPlayer)
 {
-    String name = getAppNameByFunction(CApp15);
-    ShowCustomApp(name, matrix, state, x, y, gifPlayer);
+    RENDER_CUSTOM_APP(CApp15);
 }
 
 void CApp16(FastLED_NeoMatrix *matrix, MatrixDisplayUiState *state, int16_t x, int16_t y, GifPlayer *gifPlayer)
 {
-    String name = getAppNameByFunction(CApp16);
-    ShowCustomApp(name, matrix, state, x, y, gifPlayer);
+    RENDER_CUSTOM_APP(CApp16);
 }
 
 void CApp17(FastLED_NeoMatrix *matrix, MatrixDisplayUiState *state, int16_t x, int16_t y, GifPlayer *gifPlayer)
 {
-    String name = getAppNameByFunction(CApp17);
-    ShowCustomApp(name, matrix, state, x, y, gifPlayer);
+    RENDER_CUSTOM_APP(CApp17);
 }
 
 void CApp18(FastLED_NeoMatrix *matrix, MatrixDisplayUiState *state, int16_t x, int16_t y, GifPlayer *gifPlayer)
 {
-    String name = getAppNameByFunction(CApp18);
-    ShowCustomApp(name, matrix, state, x, y, gifPlayer);
+    RENDER_CUSTOM_APP(CApp18);
 }
 
 void CApp19(FastLED_NeoMatrix *matrix, MatrixDisplayUiState *state, int16_t x, int16_t y, GifPlayer *gifPlayer)
 {
-    String name = getAppNameByFunction(CApp19);
-    ShowCustomApp(name, matrix, state, x, y, gifPlayer);
+    RENDER_CUSTOM_APP(CApp19);
 }
 
 void CApp20(FastLED_NeoMatrix *matrix, MatrixDisplayUiState *state, int16_t x, int16_t y, GifPlayer *gifPlayer)
 {
-    String name = getAppNameByFunction(CApp20);
-    ShowCustomApp(name, matrix, state, x, y, gifPlayer);
+    RENDER_CUSTOM_APP(CApp20);
 }
+
+#undef RENDER_CUSTOM_APP
 
 void (*customAppCallbacks[20])(FastLED_NeoMatrix *, MatrixDisplayUiState *, int16_t, int16_t, GifPlayer *) = {CApp1, CApp2, CApp3, CApp4, CApp5, CApp6, CApp7, CApp8, CApp9, CApp10, CApp11, CApp12, CApp13, CApp14, CApp15, CApp16, CApp17, CApp18, CApp19, CApp20};

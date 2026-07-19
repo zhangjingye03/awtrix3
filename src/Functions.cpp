@@ -249,6 +249,26 @@ String utf8ascii(String s)
     return r;
 }
 
+size_t utf8asciiToBuffer(const char *source, char *destination, size_t destinationSize)
+{
+    if (destinationSize == 0)
+    {
+        return 0;
+    }
+
+    size_t length = 0;
+    while (*source != '\0' && length + 1 < destinationSize)
+    {
+        const char converted = utf8ascii(static_cast<byte>(*source++));
+        if (converted != 0)
+        {
+            destination[length++] = converted;
+        }
+    }
+    destination[length] = '\0';
+    return length;
+}
+
 uint32_t fadeColor(uint32_t color, uint32_t interval)
 {
     float phase = (sin(2 * PI * millis() / float(interval)) + 1) * 0.5;
