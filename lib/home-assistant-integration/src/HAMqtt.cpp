@@ -203,8 +203,19 @@ bool HAMqtt::publish(const char *topic, const char *payload, bool retained)
     ARDUINOHA_DEBUG_PRINT(F(", len: "))
     ARDUINOHA_DEBUG_PRINTLN(strlen(payload))
 
-    _mqtt->beginPublish(topic, strlen(payload), retained);
-    _mqtt->write((const uint8_t *)(payload), strlen(payload));
+    const size_t length = strlen(payload);
+    if (!_mqtt->beginPublish(topic, length, retained))
+    {
+        return false;
+    }
+
+    // PubSubClient's endPublish() is currently a no-op and returns success
+    // unconditionally. Propagate a short NetworkClient write instead so the
+    // caller can close this now-corrupted MQTT packet and reconnect cleanly.
+    if (_mqtt->write(reinterpret_cast<const uint8_t *>(payload), length) != length)
+    {
+        return false;
+    }
     return _mqtt->endPublish();
 }
 

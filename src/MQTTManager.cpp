@@ -57,6 +57,10 @@ static bool c3SubscriptionsPending = false;
 static size_t c3SubscriptionIndex = 0;
 static unsigned long c3LastSubscriptionMillis = 0;
 static constexpr unsigned long C3_SUBSCRIPTION_INTERVAL_MS = 250;
+static uint8_t c3Ld2402ThresholdSyncStep = 0;
+static unsigned long c3Ld2402ThresholdSyncAt = 0;
+static bool c3WiFiStateKnown = false;
+static bool c3WiFiWasConnected = false;
 #endif
 
 static const char *ld2402MotionText()
@@ -385,8 +389,79 @@ static void publishC3HaDiscoveryTick(unsigned long now)
     case 31:
         published = clearC3HaConfig("sensor", "ld2402_motion");
         break;
+    case 64:
+        snprintf(payload, sizeof(payload),
+                 "{\"name\":\"LD2402 Reset Thresholds\",\"unique_id\":\"%s_ld2402_reset_thresholds\",\"command_topic\":\"%s/ld2402/thresholds/reset\",\"payload_press\":\"1\",\"icon\":\"mdi:restore\",%s}",
+                 MQTT_PREFIX.c_str(), MQTT_PREFIX.c_str(), deviceJson);
+        published = publishC3HaConfig("button", "ld2402_reset_thresholds", payload);
+        break;
+    case 65:
+        snprintf(payload, sizeof(payload),
+                 "{\"name\":\"LD2402 Disturbance\",\"unique_id\":\"%s_ld2402_disturbance\",\"state_topic\":\"%s/ld2402/disturbance\",\"payload_on\":\"true\",\"payload_off\":\"false\",\"device_class\":\"problem\",\"icon\":\"mdi:alert\",%s}",
+                 MQTT_PREFIX.c_str(), MQTT_PREFIX.c_str(), deviceJson);
+        published = publishC3HaConfig("binary_sensor", "ld2402_disturbance", payload);
+        break;
+    case 66:
+        snprintf(payload, sizeof(payload),
+                 "{\"name\":\"LD2402 Maximum Distance\",\"unique_id\":\"%s_ld2402_max_distance\",\"state_topic\":\"%s/ld2402/config/max_distance_cm\",\"unit_of_measurement\":\"cm\",\"icon\":\"mdi:radar\",%s}",
+                 MQTT_PREFIX.c_str(), MQTT_PREFIX.c_str(), deviceJson);
+        published = publishC3HaConfig("sensor", "ld2402_max_distance", payload);
+        break;
+    case 67:
+        snprintf(payload, sizeof(payload),
+                 "{\"name\":\"LD2402 Clear Delay\",\"unique_id\":\"%s_ld2402_clear_delay\",\"state_topic\":\"%s/ld2402/config/disappear_delay_s\",\"unit_of_measurement\":\"s\",\"icon\":\"mdi:timer-outline\",%s}",
+                 MQTT_PREFIX.c_str(), MQTT_PREFIX.c_str(), deviceJson);
+        published = publishC3HaConfig("sensor", "ld2402_clear_delay", payload);
+        break;
+    case 68:
+        snprintf(payload, sizeof(payload),
+                 "{\"name\":\"LD2402 Calibration State\",\"unique_id\":\"%s_ld2402_calibration_state\",\"state_topic\":\"%s/ld2402/calibration\",\"icon\":\"mdi:radar\",%s}",
+                 MQTT_PREFIX.c_str(), MQTT_PREFIX.c_str(), deviceJson);
+        published = publishC3HaConfig("sensor", "ld2402_calibration_state", payload);
+        break;
+    case 69:
+        snprintf(payload, sizeof(payload),
+                 "{\"name\":\"LD2402 Motion Peak\",\"unique_id\":\"%s_ld2402_motion_peak\",\"state_topic\":\"%s/ld2402/energy\",\"value_template\":\"{{ value_json.motion_peak_db }}\",\"unit_of_measurement\":\"dB\",\"icon\":\"mdi:chart-bell-curve\",%s}",
+                 MQTT_PREFIX.c_str(), MQTT_PREFIX.c_str(), deviceJson);
+        published = publishC3HaConfig("sensor", "ld2402_motion_peak", payload);
+        break;
+    case 70:
+        snprintf(payload, sizeof(payload),
+                 "{\"name\":\"LD2402 Micromotion Peak\",\"unique_id\":\"%s_ld2402_micromotion_peak\",\"state_topic\":\"%s/ld2402/energy\",\"value_template\":\"{{ value_json.micromotion_peak_db }}\",\"unit_of_measurement\":\"dB\",\"icon\":\"mdi:chart-bell-curve\",%s}",
+                 MQTT_PREFIX.c_str(), MQTT_PREFIX.c_str(), deviceJson);
+        published = publishC3HaConfig("sensor", "ld2402_micromotion_peak", payload);
+        break;
+    case 71:
+        snprintf(payload, sizeof(payload),
+                 "{\"name\":\"LD2402 Motion Peak Gate\",\"unique_id\":\"%s_ld2402_motion_peak_gate\",\"state_topic\":\"%s/ld2402/energy\",\"value_template\":\"{{ value_json.motion_peak_gate }}\",\"icon\":\"mdi:radar\",%s}",
+                 MQTT_PREFIX.c_str(), MQTT_PREFIX.c_str(), deviceJson);
+        published = publishC3HaConfig("sensor", "ld2402_motion_peak_gate", payload);
+        break;
+    case 72:
+        snprintf(payload, sizeof(payload),
+                 "{\"name\":\"LD2402 Micromotion Peak Gate\",\"unique_id\":\"%s_ld2402_micromotion_peak_gate\",\"state_topic\":\"%s/ld2402/energy\",\"value_template\":\"{{ value_json.micromotion_peak_gate }}\",\"icon\":\"mdi:radar\",%s}",
+                 MQTT_PREFIX.c_str(), MQTT_PREFIX.c_str(), deviceJson);
+        published = publishC3HaConfig("sensor", "ld2402_micromotion_peak_gate", payload);
+        break;
     default:
+        if (c3LightHaDiscoveryStep >= 32 && c3LightHaDiscoveryStep < 64)
+        {
+            const bool micromotion = c3LightHaDiscoveryStep >= 48;
+            const uint8_t gate = (c3LightHaDiscoveryStep - 32) % 16;
+            const char *kind = micromotion ? "micromotion" : "motion";
+            snprintf(payload, sizeof(payload),
+                     "{\"name\":\"LD2402 %s Gate %u\",\"unique_id\":\"%s_ld2402_%s_gate_%u\",\"state_topic\":\"%s/ld2402/threshold/%s/%u\",\"command_topic\":\"%s/ld2402/threshold/%s/%u/set\",\"min\":20,\"max\":70,\"step\":0.5,\"mode\":\"slider\",\"unit_of_measurement\":\"dB\",\"icon\":\"mdi:radar\",%s}",
+                     micromotion ? "Micromotion" : "Motion", gate, MQTT_PREFIX.c_str(), kind, gate,
+                     MQTT_PREFIX.c_str(), kind, gate, MQTT_PREFIX.c_str(), kind, gate, deviceJson);
+            char objectId[48];
+            snprintf(objectId, sizeof(objectId), "ld2402_%s_gate_%u", kind, gate);
+            published = publishC3HaConfig("number", objectId, payload);
+            break;
+        }
         c3LightHaDiscoveryPending = false;
+        // Publish retained values only after all number entities exist in HA.
+        c3Ld2402ThresholdSyncStep = 1;
+        c3Ld2402ThresholdSyncAt = now;
         if (DEBUG_MODE)
             DEBUG_PRINTLN(F("ESP32-C3 lightweight Home Assistant discovery complete"));
         return;
@@ -479,6 +554,51 @@ void processMqttMessage(const String &strTopic, const String &payloadCopy)
     if (strTopic.equals(MQTT_PREFIX + "/ld2402/calibrate"))
     {
         PeripheryManager.calibrateLD2402();
+        return;
+    }
+
+    if (strTopic.equals(MQTT_PREFIX + "/ld2402/diagnostics/request"))
+    {
+        PeripheryManager.requestLD2402Diagnostics();
+        return;
+    }
+
+    if (strTopic.equals(MQTT_PREFIX + "/ld2402/diagnostics/motion_thresholds/request"))
+    {
+        PeripheryManager.requestLD2402Thresholds(false);
+        return;
+    }
+
+    if (strTopic.equals(MQTT_PREFIX + "/ld2402/diagnostics/micromotion_thresholds/request"))
+    {
+        PeripheryManager.requestLD2402Thresholds(true);
+        return;
+    }
+
+    if (strTopic.equals(MQTT_PREFIX + "/ld2402/recovery/near_range"))
+    {
+        PeripheryManager.restoreLD2402NearRangeSensitivity();
+        return;
+    }
+
+    if (strTopic.equals(MQTT_PREFIX + "/ld2402/thresholds/reset"))
+    {
+        PeripheryManager.resetLD2402Thresholds();
+        return;
+    }
+
+    const String thresholdPrefix = MQTT_PREFIX + "/ld2402/threshold/";
+    if (strTopic.startsWith(thresholdPrefix) && strTopic.endsWith("/set"))
+    {
+        const String path = strTopic.substring(thresholdPrefix.length(), strTopic.length() - 4);
+        const int separator = path.indexOf('/');
+        if (separator > 0)
+        {
+            const String kind = path.substring(0, separator);
+            const int gate = path.substring(separator + 1).toInt();
+            if ((kind == "motion" || kind == "micromotion") && gate >= 0 && gate < 16)
+                PeripheryManager.setLD2402GateThreshold(kind == "micromotion", static_cast<uint8_t>(gate), payloadCopy.toFloat());
+        }
         return;
     }
 
@@ -893,6 +1013,13 @@ void onMqttConnected()
         "/sendscreen",
         "/r2d2",
         "/ld2402/calibrate",
+        "/ld2402/diagnostics/request",
+        "/ld2402/diagnostics/motion_thresholds/request",
+        "/ld2402/diagnostics/micromotion_thresholds/request",
+        "/ld2402/recovery/near_range",
+        "/ld2402/thresholds/reset",
+        "/ld2402/threshold/motion/+/set",
+        "/ld2402/threshold/micromotion/+/set",
         "/ha/brightness_slope",
         "/ha/matrix_power",
         "/ha/indicator1",
@@ -1375,6 +1502,38 @@ void MQTTManager_::setup()
 
 void MQTTManager_::tick()
 {
+#ifdef ESP32_C3
+    const bool c3WiFiConnected = WiFi.status() == WL_CONNECTED;
+    if (!c3WiFiStateKnown)
+    {
+        c3WiFiStateKnown = true;
+        c3WiFiWasConnected = c3WiFiConnected;
+    }
+    else if (c3WiFiConnected != c3WiFiWasConnected)
+    {
+        c3WiFiWasConnected = c3WiFiConnected;
+        connected = false;
+        c3AvailabilityWasConnected = false;
+        c3SubscriptionsPending = false;
+        c3SubscriptionIndex = 0;
+        espClient.stop();
+
+        if (c3WiFiConnected)
+        {
+            // A Wi-Fi reconnect can leave PubSubClient believing its previous
+            // TCP session is alive. Reinitialize it instead of waiting for a
+            // keepalive timeout that may never be observed on ESP32-C3.
+            mqtt.disconnect();
+            connect();
+            if (DEBUG_MODE)
+                DEBUG_PRINTLN(F("ESP32-C3 WiFi restored; restarting MQTT client"));
+        }
+        else if (DEBUG_MODE)
+        {
+            DEBUG_PRINTLN(F("ESP32-C3 WiFi lost; MQTT socket closed"));
+        }
+    }
+#endif
     if (MQTT_HOST != "")
     {
         mqtt.loop();
@@ -1413,6 +1572,23 @@ void MQTTManager_::tick()
     {
         publishC3HaDiscoveryTick(currentMillis_Stats);
     }
+    if (c3Ld2402ThresholdSyncStep == 1 && currentMillis_Stats - c3Ld2402ThresholdSyncAt >= 1000)
+    {
+        PeripheryManager.requestLD2402Thresholds(false);
+        c3Ld2402ThresholdSyncStep = 2;
+        c3Ld2402ThresholdSyncAt = currentMillis_Stats;
+    }
+    else if (c3Ld2402ThresholdSyncStep == 2 && currentMillis_Stats - c3Ld2402ThresholdSyncAt >= 3000)
+    {
+        PeripheryManager.requestLD2402Thresholds(true);
+        c3Ld2402ThresholdSyncStep = 3;
+        c3Ld2402ThresholdSyncAt = currentMillis_Stats;
+    }
+    else if (c3Ld2402ThresholdSyncStep == 3 && currentMillis_Stats - c3Ld2402ThresholdSyncAt >= 3000)
+    {
+        PeripheryManager.requestLD2402Diagnostics();
+        c3Ld2402ThresholdSyncStep = 0;
+    }
 #endif
 #ifdef ESP32_C3
     if ((currentMillis_Stats - previousMillis_Stats >= MQTT_C3_STATS_INTERVAL) && SENSORS_STABLE)
@@ -1438,7 +1614,12 @@ void MQTTManager_::publish(const char *topic, const char *payload)
         return;
     }
 
-    if (!mqtt.publish(result, payload, false))
+    // Threshold slider values must survive Home Assistant discovery ordering.
+    const bool retain = strncmp(topic, "ld2402/threshold/", 17) == 0 ||
+                        strncmp(topic, "ld2402/config/", 14) == 0 ||
+                        strcmp(topic, "ld2402/disturbance") == 0 ||
+                        strcmp(topic, "ld2402/calibration") == 0;
+    if (!mqtt.publish(result, payload, retain))
         stopMqttAfterWriteFailure();
 }
 

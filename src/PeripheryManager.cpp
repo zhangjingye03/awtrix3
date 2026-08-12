@@ -138,15 +138,24 @@ unsigned long lastLD2402Log = 0;
 uint32_t ld2402BytesReceived = 0;
 uint32_t ld2402ValidFrames = 0;
 unsigned long ld2402LastFrameAt = 0;
+unsigned long lastLD2402EnergyPublishAt = 0;
 bool ld2402CalibrationActive = false;
+bool ld2402DiagnosticsActive = false;
+unsigned long ld2402DiagnosticsStartedAt = 0;
+uint8_t ld2402DiagnosticsMode = 0;
 unsigned long ld2402CalibrationStartedAt = 0;
 unsigned long ld2402CalibrationLastQueryAt = 0;
 uint16_t ld2402CalibrationProgress = 0;
 bool ld2402CalibrationSavePending = false;
 const char *ld2402CalibrationState = "idle";
 static const unsigned long LD2402_CALIBRATION_QUERY_INTERVAL_MS = 1000;
-static const unsigned long LD2402_CALIBRATION_TIMEOUT_MS = 45000;
+// Threshold generation duration depends on the installed environment. Leave
+// enough time for the module to finish a clean-room measurement cycle.
+static const unsigned long LD2402_CALIBRATION_TIMEOUT_MS = 120000;
 static const unsigned long LD2402_FRAME_TIMEOUT_MS = 5000;
+// Engineering frames arrive about six times per second. Keep diagnostic energy
+// useful without turning it into a high-rate MQTT/HA workload on the C3.
+static const unsigned long LD2402_ENERGY_PUBLISH_INTERVAL_MS = 15000;
 #endif
 
 #ifdef awtrix2_upgrade
@@ -295,6 +304,57 @@ static void parseLD2402Line(String line)
 
 static void handleLD2402CommandFrame(const uint8_t *frame, uint16_t expectedLength);
 
+static void publishLD2402Energy(const uint8_t *frame, uint16_t expectedLength)
+{
+    // Engineering frames contain 16 moving plus 16 micromotion raw energies.
+    if (expectedLength < 141 || millis() - lastLD2402EnergyPublishAt < LD2402_ENERGY_PUBLISH_INTERVAL_MS)
+        return;
+
+    char payload[640];
+    int written = snprintf(payload, sizeof(payload), "{\"motion\":[");
+    uint8_t motionPeakGate = 0;
+    uint8_t micromotionPeakGate = 0;
+    uint32_t motionPeak = 0;
+    uint32_t micromotionPeak = 0;
+    for (uint8_t index = 0; index < 32 && written > 0 && static_cast<size_t>(written) < sizeof(payload); index++)
+    {
+        const uint16_t offset = 9 + index * 4;
+        const uint32_t energy = frame[offset] | (frame[offset + 1] << 8) |
+                                (frame[offset + 2] << 16) | (frame[offset + 3] << 24);
+        if (index < 16)
+        {
+            if (energy > motionPeak)
+            {
+                motionPeak = energy;
+                motionPeakGate = index;
+            }
+        }
+        else if (energy > micromotionPeak)
+        {
+            micromotionPeak = energy;
+            micromotionPeakGate = index - 16;
+        }
+
+        if (index == 16)
+            written += snprintf(payload + written, sizeof(payload) - written, "],\"micromotion\":[");
+        written += snprintf(payload + written, sizeof(payload) - written, "%s%lu", index == 0 || index == 16 ? "" : ",", static_cast<unsigned long>(energy));
+    }
+
+    if (written <= 0 || static_cast<size_t>(written) >= sizeof(payload))
+        return;
+
+    const float motionPeakDb = motionPeak ? 10.0f * log10f(static_cast<float>(motionPeak)) : 0.0f;
+    const float micromotionPeakDb = micromotionPeak ? 10.0f * log10f(static_cast<float>(micromotionPeak)) : 0.0f;
+    written += snprintf(payload + written, sizeof(payload) - written,
+                        "],\"motion_peak_gate\":%u,\"motion_peak_db\":%.1f,\"micromotion_peak_gate\":%u,\"micromotion_peak_db\":%.1f}",
+                        motionPeakGate, motionPeakDb, micromotionPeakGate, micromotionPeakDb);
+    if (written <= 0 || static_cast<size_t>(written) >= sizeof(payload))
+        return;
+
+    lastLD2402EnergyPublishAt = millis();
+    MQTTManager.publish("ld2402/energy", payload);
+}
+
 static void parseLD2402BinaryByte(uint8_t byte)
 {
     static uint8_t frame[160];
@@ -353,6 +413,7 @@ static void parseLD2402BinaryByte(uint8_t byte)
         const bool presence = targetState != 0;
         const int8_t movingState = targetState == 1 ? 1 : (targetState == 2 ? 0 : -1);
         setLD2402State(presence, presence ? distanceCm : 0, movingState);
+        publishLD2402Energy(frame, expectedLength);
     }
 
     pos = 0;
@@ -361,7 +422,9 @@ static void parseLD2402BinaryByte(uint8_t byte)
 
 static void parseLD2402CommandByte(uint8_t byte)
 {
-    static uint8_t frame[96];
+    // Parameter readback includes all 32 generated thresholds and is 154
+    // bytes including framing, larger than ordinary command acknowledgements.
+    static uint8_t frame[192];
     static uint16_t pos = 0;
     static uint16_t expectedLength = 0;
     static const uint8_t header[] = {0xFD, 0xFC, 0xFB, 0xFA};
@@ -426,6 +489,15 @@ static void sendLD2402Command(const uint8_t *command, size_t length)
 static void enableLD2402EngineeringMode();
 static void endLD2402ConfigMode();
 
+static void finishLD2402Diagnostics()
+{
+    ld2402DiagnosticsActive = false;
+    ld2402DiagnosticsMode = 0;
+    endLD2402ConfigMode();
+    delay(50);
+    enableLD2402EngineeringMode();
+}
+
 static void setLD2402CalibrationState(const char *state)
 {
     if (strcmp(ld2402CalibrationState, state) == 0)
@@ -457,8 +529,72 @@ static void handleLD2402CommandFrame(const uint8_t *frame, uint16_t expectedLeng
     const uint16_t commandWord = frame[6] | (frame[7] << 8);
     const uint16_t ackStatus = frame[8] | (frame[9] << 8);
 
+    if (ld2402CalibrationActive && DEBUG_MODE)
+        DEBUG_PRINTF("LD2402 calibration ACK command=0x%04X status=%u length=%u", commandWord, ackStatus, expectedLength);
+
     switch (commandWord)
     {
+    case 0x0108:
+        if (!ld2402DiagnosticsActive)
+            return;
+
+        if (ackStatus != 0 || (ld2402DiagnosticsMode == 1 && expectedLength < 26) ||
+            (ld2402DiagnosticsMode >= 2 && expectedLength < 78))
+        {
+            MQTTManager.publish("ld2402/diagnostics", "{\"error\":\"read_failed\"}");
+            finishLD2402Diagnostics();
+            return;
+        }
+
+        if (ld2402DiagnosticsMode >= 2)
+        {
+            char payload[384];
+            const char *kind = ld2402DiagnosticsMode == 2 ? "motion" : "micromotion";
+            int written = snprintf(payload, sizeof(payload), "{\"kind\":\"%s\",\"thresholds\":[", kind);
+            for (uint8_t gate = 0; gate < 16 && written > 0 && static_cast<size_t>(written) < sizeof(payload); gate++)
+            {
+                const uint16_t offset = 10 + gate * 4;
+                const uint32_t threshold = frame[offset] | (frame[offset + 1] << 8) |
+                                           (frame[offset + 2] << 16) | (frame[offset + 3] << 24);
+                const float thresholdDb = threshold ? 10.0f * log10f(static_cast<float>(threshold)) : 0.0f;
+                char stateTopic[96];
+                char stateValue[12];
+                snprintf(stateTopic, sizeof(stateTopic), "ld2402/threshold/%s/%u", kind, gate);
+                snprintf(stateValue, sizeof(stateValue), "%.1f", thresholdDb);
+                MQTTManager.publish(stateTopic, stateValue);
+                written += snprintf(payload + written, sizeof(payload) - written, "%s%lu", gate == 0 ? "" : ",", static_cast<unsigned long>(threshold));
+            }
+            if (written > 0 && static_cast<size_t>(written) < sizeof(payload))
+            {
+                snprintf(payload + written, sizeof(payload) - written, "]}");
+                MQTTManager.publish("ld2402/diagnostics", payload);
+            }
+            finishLD2402Diagnostics();
+            break;
+        }
+
+        {
+            const uint32_t maxDistanceTenths = frame[10] | (frame[11] << 8) | (frame[12] << 16) | (frame[13] << 24);
+            const uint32_t disappearDelay = frame[14] | (frame[15] << 8) | (frame[16] << 16) | (frame[17] << 24);
+            const uint32_t powerInterference = frame[18] | (frame[19] << 8) | (frame[20] << 16) | (frame[21] << 24);
+            char payload[224];
+            snprintf(payload, sizeof(payload),
+                     "{\"max_distance_cm\":%lu,\"disappear_delay_s\":%lu,\"power_interference\":%lu}",
+                     static_cast<unsigned long>(maxDistanceTenths * 10), static_cast<unsigned long>(disappearDelay),
+                     static_cast<unsigned long>(powerInterference));
+            MQTTManager.publish("ld2402/diagnostics", payload);
+            // The module reports 2 after its power-interference check detects
+            // disturbance. Publish a retained HA-friendly binary state.
+            MQTTManager.publish("ld2402/disturbance", powerInterference == 2 ? "true" : "false");
+            char configValue[16];
+            snprintf(configValue, sizeof(configValue), "%lu", static_cast<unsigned long>(maxDistanceTenths * 10));
+            MQTTManager.publish("ld2402/config/max_distance_cm", configValue);
+            snprintf(configValue, sizeof(configValue), "%lu", static_cast<unsigned long>(disappearDelay));
+            MQTTManager.publish("ld2402/config/disappear_delay_s", configValue);
+            finishLD2402Diagnostics();
+        }
+        break;
+
     case 0x0109:
         if (!ld2402CalibrationActive)
             return;
@@ -620,6 +756,12 @@ static void updateLD2402Calibration()
 
 static void updateLD2402Availability()
 {
+    if (ld2402DiagnosticsActive && millis() - ld2402DiagnosticsStartedAt >= 3000)
+    {
+        MQTTManager.publish("ld2402/diagnostics", "{\"error\":\"read_timeout\"}");
+        finishLD2402Diagnostics();
+    }
+
     if (!LD2402_AVAILABLE || ld2402CalibrationActive || millis() - ld2402LastFrameAt < LD2402_FRAME_TIMEOUT_MS)
         return;
 
@@ -1289,7 +1431,10 @@ const char *PeripheryManager_::calibrateLD2402()
 #if defined(ESP32_C3) && LD2402_ENABLED
     static const uint8_t startAutoThreshold[] = {
         0xFD, 0xFC, 0xFB, 0xFA, 0x08, 0x00, 0x09, 0x00,
-        0x1E, 0x00, 0x14, 0x00, 0x1E, 0x00, 0x04, 0x03,
+        // Use the least aggressive documented multipliers (1.0 each). The
+        // previous 3/2/3 profile learned the persistent far-field reflection
+        // as background noise and made close targets undetectable.
+        0x0A, 0x00, 0x0A, 0x00, 0x0A, 0x00, 0x04, 0x03,
         0x02, 0x01};
 
     if (!LD2402_AVAILABLE)
@@ -1304,10 +1449,6 @@ const char *PeripheryManager_::calibrateLD2402()
         return ld2402CalibrationState;
     }
 
-    enterLD2402ConfigMode();
-    delay(50);
-    sendLD2402Command(startAutoThreshold, sizeof(startAutoThreshold));
-
     ld2402CalibrationActive = true;
     ld2402CalibrationStartedAt = millis();
     ld2402CalibrationLastQueryAt = 0;
@@ -1315,9 +1456,244 @@ const char *PeripheryManager_::calibrateLD2402()
     ld2402CalibrationSavePending = false;
     setLD2402CalibrationState("started");
 
+    // Arm state tracking before the command is transmitted so an immediate
+    // ACK cannot be discarded while the radar is entering config mode.
+    enterLD2402ConfigMode();
+    delay(50);
+    sendLD2402Command(startAutoThreshold, sizeof(startAutoThreshold));
+
     if (DEBUG_MODE)
         DEBUG_PRINTLN(F("LD2402 automatic threshold calibration requested"));
     return ld2402CalibrationState;
+#else
+    return "unavailable";
+#endif
+}
+
+const char *PeripheryManager_::requestLD2402Diagnostics()
+{
+#if defined(ESP32_C3) && LD2402_ENABLED
+    static constexpr uint8_t parameterIds[] = {0x01, 0x00, 0x04, 0x00, 0x05, 0x00};
+    uint8_t command[6 + 2 + sizeof(parameterIds) + 4] = {0xFD, 0xFC, 0xFB, 0xFA};
+    const uint16_t payloadLength = 2 + sizeof(parameterIds);
+    command[4] = payloadLength & 0xFF;
+    command[5] = payloadLength >> 8;
+    command[6] = 0x08;
+    command[7] = 0x00;
+    memcpy(command + 8, parameterIds, sizeof(parameterIds));
+    command[sizeof(command) - 4] = 0x04;
+    command[sizeof(command) - 3] = 0x03;
+    command[sizeof(command) - 2] = 0x02;
+    command[sizeof(command) - 1] = 0x01;
+
+    if (!LD2402_AVAILABLE || ld2402CalibrationActive || ld2402DiagnosticsActive)
+        return "busy";
+
+    ld2402DiagnosticsActive = true;
+    ld2402DiagnosticsMode = 1;
+    ld2402DiagnosticsStartedAt = millis();
+    enterLD2402ConfigMode();
+    delay(50);
+    sendLD2402Command(command, sizeof(command));
+    return "requested";
+#else
+    return "unavailable";
+#endif
+}
+
+const char *PeripheryManager_::requestLD2402Thresholds(bool micromotion)
+{
+#if defined(ESP32_C3) && LD2402_ENABLED
+    uint8_t parameterIds[32];
+    const uint8_t baseId = micromotion ? 0x30 : 0x10;
+    for (uint8_t gate = 0; gate < 16; gate++)
+    {
+        parameterIds[gate * 2] = baseId + gate;
+        parameterIds[gate * 2 + 1] = 0x00;
+    }
+
+    uint8_t command[6 + 2 + sizeof(parameterIds) + 4] = {0xFD, 0xFC, 0xFB, 0xFA};
+    const uint16_t payloadLength = 2 + sizeof(parameterIds);
+    command[4] = payloadLength & 0xFF;
+    command[5] = payloadLength >> 8;
+    command[6] = 0x08;
+    command[7] = 0x00;
+    memcpy(command + 8, parameterIds, sizeof(parameterIds));
+    command[sizeof(command) - 4] = 0x04;
+    command[sizeof(command) - 3] = 0x03;
+    command[sizeof(command) - 2] = 0x02;
+    command[sizeof(command) - 1] = 0x01;
+
+    if (!LD2402_AVAILABLE || ld2402CalibrationActive || ld2402DiagnosticsActive)
+        return "busy";
+
+    ld2402DiagnosticsActive = true;
+    ld2402DiagnosticsMode = micromotion ? 3 : 2;
+    ld2402DiagnosticsStartedAt = millis();
+    enterLD2402ConfigMode();
+    delay(50);
+    sendLD2402Command(command, sizeof(command));
+    return "requested";
+#else
+    return "unavailable";
+#endif
+}
+
+const char *PeripheryManager_::restoreLD2402NearRangeSensitivity()
+{
+#if defined(ESP32_C3) && LD2402_ENABLED
+    // 35 dB = 10^(35 / 10) = approximately 3162. Restrict the recovery to
+    // gates 0-3 (0-2.8 m) so the prior far-field false positive remains gated.
+    constexpr uint32_t nearRangeThreshold = 3162;
+    uint8_t parameterData[8 * 6];
+    uint8_t offset = 0;
+    for (uint8_t gate = 0; gate < 4; gate++)
+    {
+        for (const uint8_t baseId : {static_cast<uint8_t>(0x10), static_cast<uint8_t>(0x30)})
+        {
+            parameterData[offset++] = baseId + gate;
+            parameterData[offset++] = 0x00;
+            parameterData[offset++] = nearRangeThreshold & 0xFF;
+            parameterData[offset++] = (nearRangeThreshold >> 8) & 0xFF;
+            parameterData[offset++] = (nearRangeThreshold >> 16) & 0xFF;
+            parameterData[offset++] = (nearRangeThreshold >> 24) & 0xFF;
+        }
+    }
+
+    uint8_t command[6 + 2 + sizeof(parameterData) + 4] = {0xFD, 0xFC, 0xFB, 0xFA};
+    const uint16_t payloadLength = 2 + sizeof(parameterData);
+    command[4] = payloadLength & 0xFF;
+    command[5] = payloadLength >> 8;
+    command[6] = 0x07;
+    command[7] = 0x00;
+    memcpy(command + 8, parameterData, sizeof(parameterData));
+    command[sizeof(command) - 4] = 0x04;
+    command[sizeof(command) - 3] = 0x03;
+    command[sizeof(command) - 2] = 0x02;
+    command[sizeof(command) - 1] = 0x01;
+    static const uint8_t saveParameters[] = {
+        0xFD, 0xFC, 0xFB, 0xFA, 0x02, 0x00, 0xFD, 0x00,
+        0x04, 0x03, 0x02, 0x01};
+
+    if (!LD2402_AVAILABLE || ld2402CalibrationActive || ld2402DiagnosticsActive)
+        return "busy";
+
+    enterLD2402ConfigMode();
+    delay(50);
+    sendLD2402Command(command, sizeof(command));
+    delay(50);
+    sendLD2402Command(saveParameters, sizeof(saveParameters));
+    delay(50);
+    endLD2402ConfigMode();
+    delay(50);
+    enableLD2402EngineeringMode();
+    MQTTManager.publish("ld2402/recovery", "near_range_sensitivity_restored");
+    return "done";
+#else
+    return "unavailable";
+#endif
+}
+
+const char *PeripheryManager_::resetLD2402Thresholds()
+{
+#if defined(ESP32_C3) && LD2402_ENABLED
+    if (!LD2402_AVAILABLE || ld2402CalibrationActive || ld2402DiagnosticsActive)
+        return "busy";
+
+    // Hi-Link does not document a factory-threshold reset command. This is a
+    // deterministic AWTRIX baseline: 45 dB moving and 40 dB micromotion.
+    constexpr uint32_t motionThreshold = 31623;
+    constexpr uint32_t micromotionThreshold = 10000;
+    uint8_t parameterData[16 * 6];
+    static const uint8_t saveParameters[] = {
+        0xFD, 0xFC, 0xFB, 0xFA, 0x02, 0x00, 0xFD, 0x00,
+        0x04, 0x03, 0x02, 0x01};
+
+    enterLD2402ConfigMode();
+    delay(50);
+    for (uint8_t pass = 0; pass < 2; pass++)
+    {
+        const uint8_t baseId = pass == 0 ? 0x10 : 0x30;
+        const uint32_t threshold = pass == 0 ? motionThreshold : micromotionThreshold;
+        for (uint8_t gate = 0, offset = 0; gate < 16; gate++)
+        {
+            parameterData[offset++] = baseId + gate;
+            parameterData[offset++] = 0x00;
+            parameterData[offset++] = threshold & 0xFF;
+            parameterData[offset++] = (threshold >> 8) & 0xFF;
+            parameterData[offset++] = (threshold >> 16) & 0xFF;
+            parameterData[offset++] = (threshold >> 24) & 0xFF;
+        }
+
+        uint8_t command[6 + 2 + sizeof(parameterData) + 4] = {0xFD, 0xFC, 0xFB, 0xFA};
+        const uint16_t payloadLength = 2 + sizeof(parameterData);
+        command[4] = payloadLength & 0xFF;
+        command[5] = payloadLength >> 8;
+        command[6] = 0x07;
+        command[7] = 0x00;
+        memcpy(command + 8, parameterData, sizeof(parameterData));
+        command[sizeof(command) - 4] = 0x04;
+        command[sizeof(command) - 3] = 0x03;
+        command[sizeof(command) - 2] = 0x02;
+        command[sizeof(command) - 1] = 0x01;
+        sendLD2402Command(command, sizeof(command));
+        delay(75);
+    }
+    sendLD2402Command(saveParameters, sizeof(saveParameters));
+    delay(75);
+    endLD2402ConfigMode();
+    delay(50);
+    enableLD2402EngineeringMode();
+
+    for (uint8_t gate = 0; gate < 16; gate++)
+    {
+        char topic[96];
+        snprintf(topic, sizeof(topic), "ld2402/threshold/motion/%u", gate);
+        MQTTManager.publish(topic, "45.0");
+        snprintf(topic, sizeof(topic), "ld2402/threshold/micromotion/%u", gate);
+        MQTTManager.publish(topic, "40.0");
+    }
+    MQTTManager.publish("ld2402/recovery", "thresholds_reset_to_awtrix_baseline");
+    return "done";
+#else
+    return "unavailable";
+#endif
+}
+
+const char *PeripheryManager_::setLD2402GateThreshold(bool micromotion, uint8_t gate, float thresholdDb)
+{
+#if defined(ESP32_C3) && LD2402_ENABLED
+    if (!LD2402_AVAILABLE || ld2402CalibrationActive || ld2402DiagnosticsActive || gate >= 16 || thresholdDb < 20.0f || thresholdDb > 70.0f)
+        return "invalid";
+
+    const uint32_t threshold = static_cast<uint32_t>(lroundf(powf(10.0f, thresholdDb / 10.0f)));
+    const uint8_t parameterId = (micromotion ? 0x30 : 0x10) + gate;
+    const uint8_t command[] = {
+        0xFD, 0xFC, 0xFB, 0xFA, 0x08, 0x00, 0x07, 0x00,
+        parameterId, 0x00,
+        static_cast<uint8_t>(threshold & 0xFF), static_cast<uint8_t>((threshold >> 8) & 0xFF),
+        static_cast<uint8_t>((threshold >> 16) & 0xFF), static_cast<uint8_t>((threshold >> 24) & 0xFF),
+        0x04, 0x03, 0x02, 0x01};
+    static const uint8_t saveParameters[] = {
+        0xFD, 0xFC, 0xFB, 0xFA, 0x02, 0x00, 0xFD, 0x00,
+        0x04, 0x03, 0x02, 0x01};
+
+    enterLD2402ConfigMode();
+    delay(50);
+    sendLD2402Command(command, sizeof(command));
+    delay(50);
+    sendLD2402Command(saveParameters, sizeof(saveParameters));
+    delay(50);
+    endLD2402ConfigMode();
+    delay(50);
+    enableLD2402EngineeringMode();
+
+    char stateTopic[96];
+    char stateValue[12];
+    snprintf(stateTopic, sizeof(stateTopic), "ld2402/threshold/%s/%u", micromotion ? "micromotion" : "motion", gate);
+    snprintf(stateValue, sizeof(stateValue), "%.1f", thresholdDb);
+    MQTTManager.publish(stateTopic, stateValue);
+    return "done";
 #else
     return "unavailable";
 #endif

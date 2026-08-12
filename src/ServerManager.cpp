@@ -226,6 +226,8 @@ static bool webOtaStarted = false;
 static size_t webOtaBytesWritten = 0;
 static size_t webOtaExpectedSize = 0;
 static String webOtaError;
+static bool webOtaRebootPending = false;
+static unsigned long webOtaRebootAt = 0;
 
 static void failWebOta(const String &error)
 {
@@ -468,8 +470,12 @@ void setupWebOtaHandler()
             {
                 server.client().setNoDelay(true);
                 server.send(200, F("text/plain"), F("OK"));
-                delay(250);
-                ESP.restart();
+                // Restarting inside WebServer's request callback can close the
+                // C3 Wi-Fi socket before the HTTP response reaches the uploader.
+                server.client().flush();
+                webOtaRebootPending = true;
+                webOtaRebootAt = millis() + 1500;
+                DEBUG_PRINTLN(F("Web OTA response sent; reboot scheduled"));
             }
             else
             {
@@ -849,6 +855,13 @@ void ServerManager_::setup()
 void ServerManager_::tick()
 {
     mws.run();
+
+    if (webOtaRebootPending && static_cast<long>(millis() - webOtaRebootAt) >= 0)
+    {
+        DEBUG_PRINTLN(F("Web OTA rebooting"));
+        delay(50);
+        ESP.restart();
+    }
 
     if (!AP_MODE)
     {

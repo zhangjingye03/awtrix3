@@ -37,6 +37,11 @@ public:
     void tick();
     void pollStartupSensors(uint16_t timeoutMs);
     const char *calibrateLD2402();
+    const char *requestLD2402Diagnostics();
+    const char *requestLD2402Thresholds(bool micromotion);
+    const char *restoreLD2402NearRangeSensitivity();
+    const char *resetLD2402Thresholds();
+    const char *setLD2402GateThreshold(bool micromotion, uint8_t gate, float thresholdDb);
     const char *getLD2402CalibrationState() const;
     void playBootSound();
     const char *playFromFile(String file);
